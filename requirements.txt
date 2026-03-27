@@ -1,0 +1,4 @@
+tencentcloud-sdk-python==3.0.1307
+PyYAML==6.0.2
+aliyun-python-sdk-core-v3==2.13.33
+aliyun-python-sdk-ecs==4.24.82

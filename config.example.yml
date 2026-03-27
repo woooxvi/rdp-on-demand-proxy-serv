@@ -1,0 +1,42 @@
+server:
+  bind: 0.0.0.0
+  verify_http_bind: 0.0.0.0
+  verify_http_port: 8080
+  external_verify_base_url: http://YOUR_PROXY_PUBLIC_IP:8080
+  max_pending_connections: 50
+
+security:
+  enabled: true
+  token_ttl_seconds: 300
+  wait_for_verification_seconds: 300
+  deny_if_timeout: true
+
+notifications:
+  telegram:
+    enabled: true
+    bot_token: YOUR_TELEGRAM_BOT_TOKEN
+    chat_id: YOUR_CHAT_ID
+    insecure_skip_verify: false
+  dingtalk:
+    enabled: false
+    webhook: ""
+    secret: ""
+  wecom:
+    enabled: false
+    webhook: ""
+
+targets:
+  - name: win-workstation-01
+    listen_port: 3389
+    target_rdp_port: 3389
+    target_ip: 10.0.0.10
+    startup_timeout_seconds: 60
+    startup_poll_seconds: 5
+    idle_shutdown_minutes: 10
+    cloud:
+      provider: tencent_cvm # or aliyun_ecs
+      secret_id: YOUR_CLOUD_ACCESS_KEY_ID
+      secret_key: YOUR_CLOUD_ACCESS_KEY_SECRET
+      region: ap-guangzhou
+      instance_id: ins-xxxxxxxx
+      stop_mode: STOP_CHARGING

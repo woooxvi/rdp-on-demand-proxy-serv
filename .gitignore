@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.venv/
+venv/
+
+# Editor
+.vscode/
+
+# Local runtime data
+*.log
+*.sqlite3
+
+# Secrets and local config
+.env
+.env.*
+config.yml
+config.local.yml
+*.pem
+*.key
+
+# Build / cache
+.pytest_cache/
+.mypy_cache/
+.dist/
+build/
+dist/
