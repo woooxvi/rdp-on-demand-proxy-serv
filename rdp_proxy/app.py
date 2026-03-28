@@ -10,7 +10,7 @@ from datetime import datetime
 
 from rdp_proxy.cloud.factory import create_provider
 from rdp_proxy.config import load_config
-from rdp_proxy.logging_utils import setup_logging
+from rdp_proxy.logging_utils import set_access_log_details, setup_logging
 from rdp_proxy.notifications import Notifier
 from rdp_proxy.proxy import RDPProxyApp
 
@@ -277,6 +277,7 @@ def main() -> None:
 
     try:
         cfg = load_config(args.config)
+        set_access_log_details(cfg.server.access_log_details)
         if args.self_check is None:
             _validate_ports(cfg)
     except Exception as exc:

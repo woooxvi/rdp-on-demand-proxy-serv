@@ -42,6 +42,7 @@ class VerificationService:
         port: int,
         external_base_url: str,
         ttl_seconds: int,
+        on_verified: Callable[[str, dict], None] | None = None,
         on_action: Callable[[str, str], None] | None = None,
     ):
         self._bind = bind
@@ -52,6 +53,7 @@ class VerificationService:
         self._action_tokens: dict[str, ActionToken] = {}
         self._lock = threading.Lock()
         self._logger = logging.getLogger("rdp_proxy.verification")
+        self._on_verified = on_verified
         self._on_action = on_action
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -185,6 +187,8 @@ class VerificationService:
                     token=token,
                     **vt.meta,
                 )
+                if service._on_verified:
+                    service._on_verified(token, vt.meta)
                 self._send_html(HTTPStatus.OK, "验证成功，RDP 连接已放行")
 
             def _handle_action(self, parsed) -> None:

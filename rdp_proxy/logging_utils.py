@@ -6,6 +6,10 @@ from datetime import datetime, timezone
 from typing import Any
 
 
+_ACCESS_LOG_DETAILS_ENABLED = True
+_IP_SENSITIVE_FIELDS = {"client_ip", "visitor_ip", "source_ip", "remote_ip"}
+
+
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {
@@ -34,5 +38,12 @@ def setup_logging(level: str = "INFO") -> None:
     root.addHandler(handler)
 
 
+def set_access_log_details(enabled: bool) -> None:
+    global _ACCESS_LOG_DETAILS_ENABLED
+    _ACCESS_LOG_DETAILS_ENABLED = enabled
+
+
 def log_with_data(logger: logging.Logger, level: int, message: str, **data: Any) -> None:
+    if not _ACCESS_LOG_DETAILS_ENABLED:
+        data = {k: v for k, v in data.items() if k not in _IP_SENSITIVE_FIELDS}
     logger.log(level, message, extra={"extra_data": data})

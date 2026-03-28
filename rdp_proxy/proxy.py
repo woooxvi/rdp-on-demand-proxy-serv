@@ -53,6 +53,12 @@ class TargetProxy:
         self._idle_action = "keep_running"
         self._max_action_retries = 3
         self._retry_backoff_seconds = [5, 10, 20]
+        self._disconnect_notify_grace_seconds = 30
+        self._disconnect_notify_generation = 0
+        # Scanner/noise suppression heuristics.
+        self._rdp_probe_timeout_seconds = 2.0
+        self._disconnect_notify_min_duration_seconds = 12.0
+        self._disconnect_notify_min_upstream_bytes = 32768
 
     def _state_satisfies_operation(self, operation: str, state: str) -> bool:
         if operation == "start":
@@ -131,8 +137,14 @@ class TargetProxy:
 
     def _handle_connection(self, client: socket.socket, client_ip: str, client_port: int) -> None:
         start_ts = time.time()
+        approved = False
+        forwarding_started = False
+        c2u_bytes = 0
+        u2c_bytes = 0
         with self._state_lock:
             self._active_connections += 1
+            # A new connection means previous pending disconnect alerts should be skipped.
+            self._disconnect_notify_generation += 1
 
         log_with_data(
             self._logger,
@@ -145,6 +157,18 @@ class TargetProxy:
 
         upstream: socket.socket | None = None
         try:
+            if not self._looks_like_rdp_client_hello(client):
+                log_with_data(
+                    self._logger,
+                    logging.INFO,
+                    "Connection dropped by scanner filter",
+                    client_ip=client_ip,
+                    client_port=client_port,
+                    target=self._target.name,
+                    reason="not_rdp_handshake_or_no_initial_payload",
+                )
+                return
+
             if self._security_enabled:
                 token, evt, url = self._verification.create_token(
                     {
@@ -153,7 +177,7 @@ class TargetProxy:
                         "instance_id": self._target.cloud.instance_id if self._target.cloud else "N/A",
                     }
                 )
-                self._notifier.send_verification(client_ip, self._target, url)
+                self._notifier.send_verification(client_ip, self._target, url, token=token)
                 log_with_data(
                     self._logger,
                     logging.INFO,
@@ -194,6 +218,7 @@ class TargetProxy:
                 latency_seconds=round(time.time() - start_ts, 2),
             )
 
+            forwarding_started = True
             c2u_bytes, u2c_bytes = self._pipe_bidirectional(client, upstream)
             log_with_data(
                 self._logger,
@@ -236,6 +261,17 @@ class TargetProxy:
             with self._state_lock:
                 self._active_connections = max(0, self._active_connections - 1)
                 self._last_disconnect_at = time.time()
+                self._disconnect_notify_generation += 1
+                disconnect_generation = self._disconnect_notify_generation
+                previous_action = self._idle_action
+
+            duration_seconds = time.time() - start_ts
+            should_notify, reason = self._should_send_disconnect_notification(
+                approved=approved,
+                forwarding_started=forwarding_started,
+                duration_seconds=duration_seconds,
+                upstream_to_client_bytes=u2c_bytes,
+            )
 
             log_with_data(
                 self._logger,
@@ -246,27 +282,111 @@ class TargetProxy:
                 duration_seconds=round(time.time() - start_ts, 2),
             )
 
-            keep_url, shutdown_url = self._verification.create_action_links(self._target.name)
-            with self._state_lock:
-                previous_action = self._idle_action
-            self._notifier.send_disconnect_options(
-                client_ip=client_ip,
-                target=self._target,
-                keep_running_url=keep_url,
-                shutdown_on_idle_url=shutdown_url,
-                previous_action=previous_action,
-            )
+            if should_notify:
+                threading.Thread(
+                    target=self._send_disconnect_options_with_grace,
+                    args=(client_ip, previous_action, disconnect_generation),
+                    name=f"disconnect-notify-{self._target.name}",
+                    daemon=True,
+                ).start()
+            else:
+                log_with_data(
+                    self._logger,
+                    logging.INFO,
+                    "Disconnect notification suppressed by eligibility filter",
+                    target=self._target.name,
+                    client_ip=client_ip,
+                    duration_seconds=round(duration_seconds, 2),
+                    client_to_upstream_bytes=c2u_bytes,
+                    upstream_to_client_bytes=u2c_bytes,
+                    reason=reason,
+                )
+            self._single_session_lock.release()
+
+    def _looks_like_rdp_client_hello(self, client: socket.socket) -> bool:
+        deadline = time.time() + self._rdp_probe_timeout_seconds
+        with suppress(OSError):
+            client.settimeout(0.2)
+
+        try:
+            while time.time() < deadline:
+                try:
+                    data = client.recv(12, socket.MSG_PEEK)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    return False
+
+                if not data:
+                    return False
+
+                # Typical RDP first packet uses TPKT + X.224 Connection Request.
+                if len(data) >= 6 and data[0] == 0x03 and data[1] == 0x00 and data[5] == 0xE0:
+                    return True
+                return False
+        finally:
+            with suppress(OSError):
+                client.settimeout(None)
+
+        return False
+
+    def _should_send_disconnect_notification(
+        self,
+        approved: bool,
+        forwarding_started: bool,
+        duration_seconds: float,
+        upstream_to_client_bytes: int,
+    ) -> tuple[bool, str]:
+        if not approved and self._security_enabled:
+            return False, "verification_not_approved"
+        if not forwarding_started:
+            return False, "forwarding_not_started"
+
+        # If RDP auth fails quickly, session usually ends in short time with low upstream bytes.
+        likely_real_session = (
+            duration_seconds >= self._disconnect_notify_min_duration_seconds
+            or upstream_to_client_bytes >= self._disconnect_notify_min_upstream_bytes
+        )
+        if not likely_real_session:
+            return False, "too_short_or_low_traffic"
+        return True, "eligible"
+
+    def _send_disconnect_options_with_grace(self, client_ip: str, previous_action: str, generation: int) -> None:
+        time.sleep(self._disconnect_notify_grace_seconds)
+
+        with self._state_lock:
+            active = self._active_connections
+            latest_generation = self._disconnect_notify_generation
+
+        if active > 0 or latest_generation != generation:
             log_with_data(
                 self._logger,
                 logging.INFO,
-                "Disconnect options sent",
-                client_ip=client_ip,
+                "Disconnect notification suppressed by reconnect window",
                 target=self._target.name,
-                previous_action=previous_action,
-                keep_running_url=keep_url,
-                shutdown_on_idle_url=shutdown_url,
+                client_ip=client_ip,
+                grace_seconds=self._disconnect_notify_grace_seconds,
             )
-            self._single_session_lock.release()
+            return
+
+        keep_url, shutdown_url = self._verification.create_action_links(self._target.name)
+        self._notifier.send_disconnect_options(
+            client_ip=client_ip,
+            target=self._target,
+            keep_running_url=keep_url,
+            shutdown_on_idle_url=shutdown_url,
+            previous_action=previous_action,
+        )
+        log_with_data(
+            self._logger,
+            logging.INFO,
+            "Disconnect options sent",
+            client_ip=client_ip,
+            target=self._target.name,
+            previous_action=previous_action,
+            keep_running_url=keep_url,
+            shutdown_on_idle_url=shutdown_url,
+        )
 
     def apply_idle_action(self, action: str) -> None:
         if action not in {"keep_running", "shutdown_on_idle"}:
@@ -640,6 +760,7 @@ class RDPProxyApp:
             port=cfg.server.verify_http_port,
             external_base_url=cfg.server.external_verify_base_url,
             ttl_seconds=cfg.security.token_ttl_seconds,
+            on_verified=self._handle_verification_approved,
             on_action=self._handle_post_disconnect_action,
         )
         self._notifier = Notifier(cfg.notifications)
@@ -676,6 +797,17 @@ class RDPProxyApp:
             "Post-disconnect action applied",
             target=target_name,
             action=action,
+        )
+
+    def _handle_verification_approved(self, token: str, meta: dict) -> None:
+        self._notifier.on_verification_approved(token)
+        log_with_data(
+            self._logger,
+            logging.INFO,
+            "Verification callback processed",
+            token=token,
+            target=meta.get("target", "unknown"),
+            client_ip=meta.get("client_ip", "unknown"),
         )
 
     def start(self) -> None:

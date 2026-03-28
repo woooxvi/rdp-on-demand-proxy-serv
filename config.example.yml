@@ -4,6 +4,7 @@ server:
   verify_http_port: 8080
   external_verify_base_url: http://YOUR_PROXY_PUBLIC_IP:8080
   max_pending_connections: 50
+  access_log_details: true
 
 security:
   enabled: true
@@ -24,6 +25,13 @@ notifications:
   wecom:
     enabled: false
     webhook: ""
+  privacy:
+    mask_client_ip: true
+  geoip:
+    enabled: false
+    endpoint_template: https://ipapi.co/{ip}/json/
+    timeout_seconds: 2.0
+    cache_ttl_seconds: 3600
 
 targets:
   - name: win-workstation-01

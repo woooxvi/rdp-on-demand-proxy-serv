@@ -6,6 +6,8 @@ import ssl
 import base64
 import hashlib
 import hmac
+import ipaddress
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -20,19 +22,40 @@ class Notifier:
     def __init__(self, config: NotificationsConfig):
         self._cfg = config
         self._logger = logging.getLogger("rdp_proxy.notifications")
+        self._telegram_verification_messages: dict[str, list[int]] = {}
+        self._geoip_cache: dict[str, tuple[float, str]] = {}
+        self._lock = threading.Lock()
 
-    def send_verification(self, client_ip: str, target: TargetConfig, verify_url: str) -> None:
+    def send_verification(self, client_ip: str, target: TargetConfig, verify_url: str, token: str = "") -> None:
         title = "RDP 登录请求提醒"
         instance_id = target.cloud.instance_id if target.cloud else "N/A"
+        origin = self._format_origin(client_ip)
         text = (
-            f"来自 {client_ip} 的 RDP 访问请求，点击链接允许连接\n"
+            f"来自 {origin} 的 RDP 访问请求，点击链接允许连接\n"
             f"实例: {instance_id}\n"
             f"目标IP: {target.target_ip}\n"
             f"时间: {datetime.now().isoformat(sep=' ', timespec='seconds')}\n"
             f"验证链接: {verify_url}"
         )
 
-        results = self._broadcast(title, text)
+        telegram_text = (
+            f"<b>{self._escape_html(title)}</b>\n\n"
+            f"来自 {self._escape_html(origin)} 的 RDP 访问请求，点击链接允许连接\n"
+            f"实例: {self._escape_html(instance_id)}\n"
+            f"目标IP: {self._escape_html(target.target_ip)}\n"
+            f"时间: {self._escape_html(datetime.now().isoformat(sep=' ', timespec='seconds'))}\n"
+            f"验证链接: {self._escape_html(verify_url)}"
+        )
+
+        results, telegram_message_id = self._broadcast(
+            title,
+            text,
+            telegram_text=telegram_text,
+            telegram_parse_mode="HTML",
+        )
+        if token and telegram_message_id is not None:
+            with self._lock:
+                self._telegram_verification_messages.setdefault(token, []).append(telegram_message_id)
         sent = any(results.values())
 
         if not sent:
@@ -55,17 +78,30 @@ class Notifier:
         title = "RDP 连接断开提醒"
         instance_id = target.cloud.instance_id if target.cloud else "N/A"
         previous_text = "立即关机" if previous_action == "shutdown_on_idle" else "保持开机"
+        origin = self._format_origin(client_ip)
+        now_text = datetime.now().isoformat(sep=' ', timespec='seconds')
         text = (
-            f"来自 {client_ip} 的 RDP 会话已断开\n"
+            f"来自 {origin} 的 RDP 会话已断开\n"
             f"实例: {instance_id}\n"
             f"目标IP: {target.target_ip}\n"
-            f"时间: {datetime.now().isoformat(sep=' ', timespec='seconds')}\n"
+            f"时间: {now_text}\n"
             f"上一次选择: {previous_text}\n"
             f"保持开机: {keep_running_url}\n"
             f"立即关机(空闲超时后执行): {shutdown_on_idle_url}"
         )
 
-        results = self._broadcast(title, text)
+        telegram_text = (
+            f"<b>{self._escape_html(title)}</b>\n\n"
+            f"来自 {self._escape_html(origin)} 的 RDP 会话已断开\n"
+            f"实例: {self._escape_html(instance_id)}\n"
+            f"目标IP: {self._escape_html(target.target_ip)}\n"
+            f"时间: {self._escape_html(now_text)}\n"
+            f"上一次选择: {self._escape_html(previous_text)}\n"
+            f"<b>保持开机</b>: {self._escape_html(keep_running_url)}\n"
+            f"<b>立即关机</b>(空闲超时后执行): {self._escape_html(shutdown_on_idle_url)}"
+        )
+
+        results, _ = self._broadcast(title, text, telegram_text=telegram_text, telegram_parse_mode="HTML")
         sent = any(results.values())
 
         if not sent:
@@ -79,7 +115,28 @@ class Notifier:
 
     def send_test_message(self, text: str) -> dict[str, bool]:
         title = "RDP Proxy 通知测试"
-        return self._broadcast(title, text)
+        results, _ = self._broadcast(title, text)
+        return results
+
+    def on_verification_approved(self, token: str) -> None:
+        if not token:
+            return
+        if not self._cfg.telegram.enabled:
+            return
+
+        with self._lock:
+            message_ids = list(self._telegram_verification_messages.pop(token, []))
+
+        for message_id in message_ids:
+            ok = self._delete_telegram_message(message_id)
+            log_with_data(
+                self._logger,
+                logging.INFO,
+                "Telegram verification message delete attempted",
+                token=token,
+                message_id=message_id,
+                deleted=ok,
+            )
 
     def send_cloud_operation_result(
         self,
@@ -107,12 +164,24 @@ class Notifier:
         if error:
             text += f"\n错误: {error}"
 
-        return self._broadcast(title, text)
+        results, _ = self._broadcast(title, text)
+        return results
 
-    def _broadcast(self, title: str, text: str) -> dict[str, bool]:
+    def _broadcast(
+        self,
+        title: str,
+        text: str,
+        telegram_text: str | None = None,
+        telegram_parse_mode: str | None = None,
+    ) -> tuple[dict[str, bool], int | None]:
         results: dict[str, bool] = {}
+        telegram_message_id: int | None = None
         if self._cfg.telegram.enabled:
-            results["telegram"] = self._send_telegram(f"{title}\n\n{text}")
+            telegram_ok, telegram_message_id = self._send_telegram(
+                telegram_text if telegram_text is not None else f"{title}\n\n{text}",
+                parse_mode=telegram_parse_mode,
+            )
+            results["telegram"] = telegram_ok
         if self._cfg.dingtalk.enabled:
             results["dingtalk"] = self._send_dingtalk(title, text)
         if self._cfg.wecom.enabled:
@@ -124,9 +193,18 @@ class Notifier:
             "Notification broadcast result",
             **results,
         )
-        return results
+        return results, telegram_message_id
 
     def _post_json(self, url: str, payload: dict, insecure_skip_verify: bool = False) -> bool:
+        ok, _ = self._post_json_with_response(url, payload, insecure_skip_verify=insecure_skip_verify)
+        return ok
+
+    def _post_json_with_response(
+        self,
+        url: str,
+        payload: dict,
+        insecure_skip_verify: bool = False,
+    ) -> tuple[bool, dict | None]:
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             url,
@@ -137,17 +215,22 @@ class Notifier:
         try:
             context = ssl._create_unverified_context() if insecure_skip_verify else None
             with urllib.request.urlopen(req, timeout=8, context=context) as resp:
-                _ = resp.read()
-            return True
+                raw = resp.read()
+            if not raw:
+                return True, None
+            try:
+                return True, json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return True, None
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             log_with_data(self._logger, logging.ERROR, "Notification request failed", error=str(exc), url=url)
-            return False
+            return False, None
 
-    def _send_telegram(self, text: str) -> bool:
+    def _send_telegram(self, text: str, parse_mode: str | None = None) -> tuple[bool, int | None]:
         token = self._cfg.telegram.bot_token
         chat_id = self._cfg.telegram.chat_id
         if not token or not chat_id:
-            return False
+            return False, None
 
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         payload = {
@@ -155,7 +238,32 @@ class Notifier:
             "text": text,
             "disable_web_page_preview": False,
         }
-        return self._post_json(url, payload, insecure_skip_verify=self._cfg.telegram.insecure_skip_verify)
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        ok, response = self._post_json_with_response(url, payload, insecure_skip_verify=self._cfg.telegram.insecure_skip_verify)
+        if not ok:
+            return False, None
+
+        message_id: int | None = None
+        if isinstance(response, dict):
+            result = response.get("result")
+            if isinstance(result, dict) and isinstance(result.get("message_id"), int):
+                message_id = result["message_id"]
+        return True, message_id
+
+    def _delete_telegram_message(self, message_id: int) -> bool:
+        token = self._cfg.telegram.bot_token
+        chat_id = self._cfg.telegram.chat_id
+        if not token or not chat_id:
+            return False
+
+        url = f"https://api.telegram.org/bot{token}/deleteMessage"
+        payload = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+        }
+        ok, _ = self._post_json_with_response(url, payload, insecure_skip_verify=self._cfg.telegram.insecure_skip_verify)
+        return ok
 
     def _send_dingtalk(self, title: str, text: str) -> bool:
         webhook = self._cfg.dingtalk.webhook
@@ -191,3 +299,73 @@ class Notifier:
             },
         }
         return self._post_json(webhook, payload)
+
+    def _format_origin(self, client_ip: str) -> str:
+        masked = self._mask_ip(client_ip) if self._cfg.privacy.mask_client_ip else client_ip
+        city = self._resolve_city(client_ip)
+        if city:
+            return f"IP尾号 {masked} ({city})"
+        return f"IP尾号 {masked}"
+
+    def _mask_ip(self, client_ip: str) -> str:
+        try:
+            ip_obj = ipaddress.ip_address(client_ip)
+        except ValueError:
+            if len(client_ip) <= 3:
+                return client_ip
+            return client_ip[-3:]
+
+        if isinstance(ip_obj, ipaddress.IPv4Address):
+            return client_ip.split(".")[-1]
+
+        exploded = ip_obj.exploded.split(":")
+        return exploded[-1][-4:]
+
+    def _resolve_city(self, client_ip: str) -> str:
+        if not self._cfg.geoip.enabled:
+            return ""
+
+        now = time.time()
+        with self._lock:
+            cached = self._geoip_cache.get(client_ip)
+            if cached and cached[0] >= now:
+                return cached[1]
+
+        city_text = self._lookup_city_online(client_ip)
+        expire_at = now + max(1, self._cfg.geoip.cache_ttl_seconds)
+        with self._lock:
+            self._geoip_cache[client_ip] = (expire_at, city_text)
+        return city_text
+
+    def _lookup_city_online(self, client_ip: str) -> str:
+        endpoint = self._cfg.geoip.endpoint_template.format(ip=urllib.parse.quote(client_ip, safe=""))
+        req = urllib.request.Request(endpoint, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=max(0.2, self._cfg.geoip.timeout_seconds)) as resp:
+                raw = resp.read()
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+            log_with_data(self._logger, logging.WARNING, "GeoIP lookup failed", client_ip=client_ip, error=str(exc))
+            return ""
+
+        if not raw:
+            return ""
+
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return ""
+        if not isinstance(payload, dict):
+            return ""
+
+        city = str(payload.get("city", "")).strip()
+        region = str(payload.get("region", payload.get("regionName", "")).strip())
+        country = str(payload.get("country_name", payload.get("country", "")).strip())
+        parts = [p for p in [city, region, country] if p]
+        return "/".join(parts)
+
+    def _escape_html(self, text: str) -> str:
+        return (
+            text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )

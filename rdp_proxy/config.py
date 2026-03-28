@@ -13,6 +13,7 @@ class ServerConfig:
     verify_http_port: int
     external_verify_base_url: str
     max_pending_connections: int = 50
+    access_log_details: bool = True
 
 
 @dataclass(frozen=True)
@@ -45,10 +46,25 @@ class WeComConfig:
 
 
 @dataclass(frozen=True)
+class NotificationPrivacyConfig:
+    mask_client_ip: bool = True
+
+
+@dataclass(frozen=True)
+class GeoIPConfig:
+    enabled: bool = False
+    endpoint_template: str = "https://ipapi.co/{ip}/json/"
+    timeout_seconds: float = 2.0
+    cache_ttl_seconds: int = 3600
+
+
+@dataclass(frozen=True)
 class NotificationsConfig:
     telegram: TelegramConfig
     dingtalk: DingTalkConfig
     wecom: WeComConfig
+    privacy: NotificationPrivacyConfig
+    geoip: GeoIPConfig
 
 
 @dataclass(frozen=True)
@@ -151,6 +167,7 @@ def load_config(config_path: str) -> AppConfig:
             verify_http_port=int(server.get("verify_http_port", 8080)),
             external_verify_base_url=server["external_verify_base_url"],
             max_pending_connections=int(server.get("max_pending_connections", 50)),
+            access_log_details=bool(server.get("access_log_details", True)),
         ),
         security=SecurityConfig(
             enabled=bool(security.get("enabled", True)),
@@ -173,6 +190,15 @@ def load_config(config_path: str) -> AppConfig:
             wecom=WeComConfig(
                 enabled=bool(notifications["wecom"].get("enabled", False)),
                 webhook=notifications["wecom"].get("webhook", ""),
+            ),
+            privacy=NotificationPrivacyConfig(
+                mask_client_ip=bool(notifications.get("privacy", {}).get("mask_client_ip", True)),
+            ),
+            geoip=GeoIPConfig(
+                enabled=bool(notifications.get("geoip", {}).get("enabled", False)),
+                endpoint_template=str(notifications.get("geoip", {}).get("endpoint_template", "https://ipapi.co/{ip}/json/")),
+                timeout_seconds=float(notifications.get("geoip", {}).get("timeout_seconds", 2.0)),
+                cache_ttl_seconds=int(notifications.get("geoip", {}).get("cache_ttl_seconds", 3600)),
             ),
         ),
         targets=targets,
