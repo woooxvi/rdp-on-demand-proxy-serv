@@ -53,7 +53,11 @@ class NotificationPrivacyConfig:
 @dataclass(frozen=True)
 class GeoIPConfig:
     enabled: bool = False
-    endpoint_template: str = "https://ipapi.co/{ip}/json/"
+    endpoint_templates: tuple[str, ...] = (
+        "https://ipwho.is/{ip}",
+        "https://ipapi.co/{ip}/json/",
+        "http://ip-api.com/json/{ip}?fields=status,country,regionName,city",
+    )
     timeout_seconds: float = 2.0
     cache_ttl_seconds: int = 3600
 
@@ -122,6 +126,24 @@ def load_config(config_path: str) -> AppConfig:
     server = raw["server"]
     security = raw["security"]
     notifications = raw["notifications"]
+    geoip_raw = notifications.get("geoip", {})
+
+    endpoint_templates_raw = geoip_raw.get("endpoint_templates")
+    endpoint_templates: tuple[str, ...]
+    if isinstance(endpoint_templates_raw, list):
+        endpoint_templates = tuple(str(x).strip() for x in endpoint_templates_raw if str(x).strip())
+    elif isinstance(endpoint_templates_raw, str) and endpoint_templates_raw.strip():
+        endpoint_templates = (endpoint_templates_raw.strip(),)
+    else:
+        legacy_single = str(geoip_raw.get("endpoint_template", "")).strip()
+        if legacy_single:
+            endpoint_templates = (legacy_single,)
+        else:
+            endpoint_templates = (
+                "https://ipwho.is/{ip}",
+                "https://ipapi.co/{ip}/json/",
+                "http://ip-api.com/json/{ip}?fields=status,country,regionName,city",
+            )
 
     targets: list[TargetConfig] = []
     for item in raw["targets"]:
@@ -195,10 +217,10 @@ def load_config(config_path: str) -> AppConfig:
                 mask_client_ip=bool(notifications.get("privacy", {}).get("mask_client_ip", True)),
             ),
             geoip=GeoIPConfig(
-                enabled=bool(notifications.get("geoip", {}).get("enabled", False)),
-                endpoint_template=str(notifications.get("geoip", {}).get("endpoint_template", "https://ipapi.co/{ip}/json/")),
-                timeout_seconds=float(notifications.get("geoip", {}).get("timeout_seconds", 2.0)),
-                cache_ttl_seconds=int(notifications.get("geoip", {}).get("cache_ttl_seconds", 3600)),
+                enabled=bool(geoip_raw.get("enabled", False)),
+                endpoint_templates=endpoint_templates,
+                timeout_seconds=float(geoip_raw.get("timeout_seconds", 2.0)),
+                cache_ttl_seconds=int(geoip_raw.get("cache_ttl_seconds", 3600)),
             ),
         ),
         targets=targets,

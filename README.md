@@ -135,6 +135,8 @@ sudo systemctl status rdp-proxy
 - 断开提醒采用 30 秒观察窗口：若断开后 30 秒内出现新连接，会抑制上一条断开提醒，减少“密码阶段二次建连”噪声。
 - 通知中的来源 IP 默认脱敏为“IP 尾号”。
 - 可选开启 `notifications.geoip.enabled` 获取来源城市信息（依赖外部 GeoIP HTTP 接口，失败时自动降级为仅显示 IP 尾号）。
+- `notifications.geoip.endpoint_templates` 支持配置多个 GeoIP 接口地址，按顺序自动回退：前一个不可达/被拦截时会尝试下一个。
+- 保持向后兼容：如果仍使用单个 `endpoint_template` 字段，也可正常工作。
 
 连接噪声识别策略：
 

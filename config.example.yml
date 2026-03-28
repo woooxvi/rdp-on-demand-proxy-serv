@@ -29,7 +29,10 @@ notifications:
     mask_client_ip: true
   geoip:
     enabled: false
-    endpoint_template: https://ipapi.co/{ip}/json/
+    endpoint_templates:
+      - https://ipwho.is/{ip}
+      - https://ipapi.co/{ip}/json/
+      - http://ip-api.com/json/{ip}?fields=status,country,regionName,city
     timeout_seconds: 2.0
     cache_ttl_seconds: 3600
 

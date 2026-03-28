@@ -338,30 +338,62 @@ class Notifier:
         return city_text
 
     def _lookup_city_online(self, client_ip: str) -> str:
-        endpoint = self._cfg.geoip.endpoint_template.format(ip=urllib.parse.quote(client_ip, safe=""))
-        req = urllib.request.Request(endpoint, method="GET")
-        try:
-            with urllib.request.urlopen(req, timeout=max(0.2, self._cfg.geoip.timeout_seconds)) as resp:
-                raw = resp.read()
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
-            log_with_data(self._logger, logging.WARNING, "GeoIP lookup failed", client_ip=client_ip, error=str(exc))
+        endpoints = self._build_geoip_endpoints(client_ip)
+        if not endpoints:
             return ""
 
-        if not raw:
-            return ""
+        timeout_seconds = max(0.2, self._cfg.geoip.timeout_seconds)
+        for endpoint in endpoints:
+            req = urllib.request.Request(endpoint, method="GET")
+            try:
+                with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+                    raw = resp.read()
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+                log_with_data(
+                    self._logger,
+                    logging.WARNING,
+                    "GeoIP lookup failed on endpoint",
+                    client_ip=client_ip,
+                    endpoint=endpoint,
+                    error=str(exc),
+                )
+                continue
 
-        try:
-            payload = json.loads(raw.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            return ""
-        if not isinstance(payload, dict):
-            return ""
+            if not raw:
+                continue
 
-        city = str(payload.get("city", "")).strip()
-        region = str(payload.get("region", payload.get("regionName", "")).strip())
-        country = str(payload.get("country_name", payload.get("country", "")).strip())
-        parts = [p for p in [city, region, country] if p]
-        return "/".join(parts)
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+
+            # Common providers expose different field names.
+            city = str(payload.get("city", payload.get("city_name", ""))).strip()
+            region = str(payload.get("region", payload.get("regionName", payload.get("region_name", "")))).strip()
+            country = str(payload.get("country_name", payload.get("country", payload.get("countryCode", "")))).strip()
+            parts = [p for p in [city, region, country] if p]
+            if parts:
+                return "/".join(parts)
+
+        return ""
+
+    def _build_geoip_endpoints(self, client_ip: str) -> list[str]:
+        encoded_ip = urllib.parse.quote(client_ip, safe="")
+        results: list[str] = []
+        for template in self._cfg.geoip.endpoint_templates:
+            tpl = str(template).strip()
+            if not tpl:
+                continue
+            if "{ip}" in tpl:
+                results.append(tpl.replace("{ip}", encoded_ip))
+                continue
+            if tpl.endswith("/"):
+                results.append(f"{tpl}{encoded_ip}")
+            else:
+                results.append(f"{tpl}/{encoded_ip}")
+        return results
 
     def _escape_html(self, text: str) -> str:
         return (
