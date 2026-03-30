@@ -14,6 +14,11 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
+try:
+    import pytz
+except ImportError:
+    pytz = None
+
 from rdp_proxy.config import NotificationsConfig, TargetConfig
 from rdp_proxy.logging_utils import log_with_data
 
@@ -25,16 +30,48 @@ class Notifier:
         self._telegram_verification_messages: dict[str, list[int]] = {}
         self._geoip_cache: dict[str, tuple[float, str]] = {}
         self._lock = threading.Lock()
+        self._timezone_obj = self._init_timezone()
+
+    def _init_timezone(self):
+        """Initialize timezone object based on config."""
+        tz_config = self._cfg.timezone.strip()
+        if tz_config == "utc":
+            return None  # Special marker for UTC
+        if tz_config == "server":
+            return "server"  # Special marker for server local time
+        # Try to load as IANA timezone
+        if pytz:
+            try:
+                return pytz.timezone(tz_config)
+            except pytz.exceptions.UnknownTimeZoneError:
+                self._logger.warning(f"Unknown timezone: {tz_config}, falling back to server time")
+                return "server"
+        else:
+            self._logger.warning("pytz not installed, cannot use IANA timezones, falling back to server time")
+            return "server"
+
+    def _format_time(self) -> str:
+        """Format current time according to configured timezone."""
+        if self._timezone_obj is None:
+            # UTC
+            return datetime.utcnow().isoformat(sep=' ', timespec='seconds') + " UTC"
+        elif self._timezone_obj == "server":
+            # Server local time
+            return datetime.now().isoformat(sep=' ', timespec='seconds')
+        else:
+            # IANA timezone
+            return datetime.now(self._timezone_obj).isoformat(sep=' ', timespec='seconds')
 
     def send_verification(self, client_ip: str, target: TargetConfig, verify_url: str, token: str = "") -> None:
         title = "RDP 登录请求提醒"
         instance_id = target.cloud.instance_id if target.cloud else "N/A"
         origin = self._format_origin(client_ip)
+        time_str = self._format_time()
         text = (
             f"来自 {origin} 的 RDP 访问请求，点击链接允许连接\n"
             f"实例: {instance_id}\n"
             f"目标IP: {target.target_ip}\n"
-            f"时间: {datetime.now().isoformat(sep=' ', timespec='seconds')}\n"
+            f"时间: {time_str}\n"
             f"验证链接: {verify_url}"
         )
 
@@ -43,7 +80,7 @@ class Notifier:
             f"来自 {self._escape_html(origin)} 的 RDP 访问请求，点击链接允许连接\n"
             f"实例: {self._escape_html(instance_id)}\n"
             f"目标IP: {self._escape_html(target.target_ip)}\n"
-            f"时间: {self._escape_html(datetime.now().isoformat(sep=' ', timespec='seconds'))}\n"
+            f"时间: {self._escape_html(time_str)}\n"
             f"验证链接: {self._escape_html(verify_url)}"
         )
 
@@ -79,7 +116,7 @@ class Notifier:
         instance_id = target.cloud.instance_id if target.cloud else "N/A"
         previous_text = "立即关机" if previous_action == "shutdown_on_idle" else "保持开机"
         origin = self._format_origin(client_ip)
-        now_text = datetime.now().isoformat(sep=' ', timespec='seconds')
+        now_text = self._format_time()
         text = (
             f"来自 {origin} 的 RDP 会话已断开\n"
             f"实例: {instance_id}\n"
@@ -159,7 +196,7 @@ class Notifier:
             f"操作: {operation_text}\n"
             f"结果: {result_text}\n"
             f"尝试次数: {attempts}\n"
-            f"时间: {datetime.now().isoformat(sep=' ', timespec='seconds')}"
+            f"时间: {self._format_time()}"
         )
         if error:
             text += f"\n错误: {error}"

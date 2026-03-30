@@ -25,6 +25,7 @@ notifications:
   wecom:
     enabled: false
     webhook: ""
+  timezone: "server"  # "utc", "server", or IANA timezone like "Asia/Shanghai", "America/New_York"
   privacy:
     mask_client_ip: true
   geoip:

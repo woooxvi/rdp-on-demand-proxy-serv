@@ -69,6 +69,7 @@ class NotificationsConfig:
     wecom: WeComConfig
     privacy: NotificationPrivacyConfig
     geoip: GeoIPConfig
+    timezone: str = "server"
 
 
 @dataclass(frozen=True)
@@ -222,6 +223,7 @@ def load_config(config_path: str) -> AppConfig:
                 timeout_seconds=float(geoip_raw.get("timeout_seconds", 2.0)),
                 cache_ttl_seconds=int(geoip_raw.get("cache_ttl_seconds", 3600)),
             ),
+            timezone=str(notifications.get("timezone", "server")).strip(),
         ),
         targets=targets,
     )
