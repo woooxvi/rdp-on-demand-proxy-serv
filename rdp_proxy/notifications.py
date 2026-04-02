@@ -24,10 +24,12 @@ from rdp_proxy.logging_utils import log_with_data
 
 
 class Notifier:
-    def __init__(self, config: NotificationsConfig):
+    def __init__(self, config: NotificationsConfig, verification_message_ttl_seconds: int = 300):
         self._cfg = config
+        self._verification_message_ttl_seconds = max(1, int(verification_message_ttl_seconds))
         self._logger = logging.getLogger("rdp_proxy.notifications")
         self._telegram_verification_messages: dict[str, list[int]] = {}
+        self._telegram_disconnect_messages: dict[str, list[int]] = {}
         self._geoip_cache: dict[str, tuple[float, str]] = {}
         self._lock = threading.Lock()
         self._timezone_obj = self._init_timezone()
@@ -93,6 +95,12 @@ class Notifier:
         if token and telegram_message_id is not None:
             with self._lock:
                 self._telegram_verification_messages.setdefault(token, []).append(telegram_message_id)
+            threading.Thread(
+                target=self._delete_verification_message_after_ttl,
+                args=(token, telegram_message_id),
+                name="tg-verify-auto-delete",
+                daemon=True,
+            ).start()
         sent = any(results.values())
 
         if not sent:
@@ -138,7 +146,10 @@ class Notifier:
             f"<b>立即关机</b>(空闲超时后执行): {self._escape_html(shutdown_on_idle_url)}"
         )
 
-        results, _ = self._broadcast(title, text, telegram_text=telegram_text, telegram_parse_mode="HTML")
+        results, telegram_message_id = self._broadcast(title, text, telegram_text=telegram_text, telegram_parse_mode="HTML")
+        if telegram_message_id is not None:
+            with self._lock:
+                self._telegram_disconnect_messages.setdefault(target.name, []).append(telegram_message_id)
         sent = any(results.values())
 
         if not sent:
@@ -174,6 +185,54 @@ class Notifier:
                 message_id=message_id,
                 deleted=ok,
             )
+
+    def on_connection_established(self, target_name: str) -> None:
+        if not target_name:
+            return
+        if not self._cfg.telegram.enabled:
+            return
+
+        with self._lock:
+            message_ids = list(self._telegram_disconnect_messages.pop(target_name, []))
+
+        for message_id in message_ids:
+            ok = self._delete_telegram_message(message_id)
+            log_with_data(
+                self._logger,
+                logging.INFO,
+                "Telegram disconnect message delete attempted",
+                target=target_name,
+                message_id=message_id,
+                deleted=ok,
+            )
+
+    def _delete_verification_message_after_ttl(self, token: str, message_id: int) -> None:
+        time.sleep(self._verification_message_ttl_seconds)
+
+        if not self._cfg.telegram.enabled:
+            return
+
+        should_delete = False
+        with self._lock:
+            msg_ids = self._telegram_verification_messages.get(token, [])
+            if message_id in msg_ids:
+                msg_ids.remove(message_id)
+                should_delete = True
+                if not msg_ids:
+                    self._telegram_verification_messages.pop(token, None)
+
+        if not should_delete:
+            return
+
+        ok = self._delete_telegram_message(message_id)
+        log_with_data(
+            self._logger,
+            logging.INFO,
+            "Telegram verification message auto-delete attempted",
+            token=token,
+            message_id=message_id,
+            deleted=ok,
+        )
 
     def send_cloud_operation_result(
         self,

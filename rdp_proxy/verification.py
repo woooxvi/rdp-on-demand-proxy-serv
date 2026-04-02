@@ -133,6 +133,28 @@ class VerificationService:
             vt = self._tokens.get(token)
             return bool(vt and vt.approved)
 
+    def cancel_token(self, token: str) -> bool:
+        if not token:
+            return False
+
+        with self._lock:
+            vt = self._tokens.pop(token, None)
+
+        if not vt:
+            return False
+
+        vt.used = True
+        vt.approved = False
+        vt.event.set()
+        log_with_data(
+            self._logger,
+            logging.INFO,
+            "Verification token cancelled",
+            token=token,
+            **vt.meta,
+        )
+        return True
+
     def _cleanup_locked(self, now: float) -> None:
         expired = [k for k, v in self._tokens.items() if v.expires_at < now or (v.used and now - v.created_at > 3600)]
         for k in expired:

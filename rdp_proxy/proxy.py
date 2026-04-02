@@ -6,11 +6,13 @@ import socket
 import threading
 import time
 from contextlib import suppress
+from datetime import datetime
+from pathlib import Path
 
 from rdp_proxy.cloud.base import CloudProvider
 from rdp_proxy.cloud.factory import create_provider
 from rdp_proxy.config import AppConfig, TargetConfig
-from rdp_proxy.logging_utils import log_with_data
+from rdp_proxy.logging_utils import log_with_data, sanitize_sensitive_log_fields
 from rdp_proxy.notifications import Notifier
 from rdp_proxy.verification import VerificationService
 
@@ -33,6 +35,7 @@ class TargetProxy:
         self._verification = verification
         self._security_enabled = security_enabled
         self._verification_wait_seconds = verification_wait_seconds
+        self._verification_notify_delay_seconds = 2.0
         self._deny_if_timeout = deny_if_timeout
         self._max_pending_connections = max_pending_connections
         self._provider: CloudProvider | None = (
@@ -59,6 +62,12 @@ class TargetProxy:
         self._rdp_probe_timeout_seconds = 2.0
         self._disconnect_notify_min_duration_seconds = 12.0
         self._disconnect_notify_min_upstream_bytes = 32768
+        self._connection_log_lock = threading.Lock()
+        self._connection_log_path = Path("logs") / f"connections-{self._target.name}.log"
+        self._connection_log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def set_verification_notify_delay(self, delay_seconds: float) -> None:
+        self._verification_notify_delay_seconds = max(0.0, float(delay_seconds))
 
     def _state_satisfies_operation(self, operation: str, state: str) -> bool:
         if operation == "start":
@@ -154,6 +163,12 @@ class TargetProxy:
             client_port=client_port,
             target=self._target.name,
         )
+        self._append_connection_audit(
+            "connected",
+            client_ip=client_ip,
+            client_port=client_port,
+            target=self._target.name,
+        )
 
         upstream: socket.socket | None = None
         try:
@@ -170,6 +185,17 @@ class TargetProxy:
                 return
 
             if self._security_enabled:
+                if not self._wait_for_verification_notify_window(client):
+                    self._append_connection_audit(
+                        "verification_notify_suppressed",
+                        client_ip=client_ip,
+                        client_port=client_port,
+                        target=self._target.name,
+                        reason="client_disconnected_before_notify_window",
+                        delay_seconds=round(self._verification_notify_delay_seconds, 2),
+                    )
+                    return
+
                 token, evt, url = self._verification.create_token(
                     {
                         "target": self._target.name,
@@ -186,7 +212,29 @@ class TargetProxy:
                     token=token,
                     verify_url=url,
                 )
-                approved = evt.wait(timeout=self._verification_wait_seconds)
+                self._append_connection_audit(
+                    "verification_sent",
+                    client_ip=client_ip,
+                    client_port=client_port,
+                    target=self._target.name,
+                    token=token,
+                    delay_seconds=round(self._verification_notify_delay_seconds, 2),
+                )
+                approved, wait_reason = self._wait_for_verification_or_disconnect(
+                    client=client,
+                    event=evt,
+                    timeout_seconds=self._verification_wait_seconds,
+                )
+                if not approved and wait_reason == "client_disconnected":
+                    self._verification.cancel_token(token)
+                    self._append_connection_audit(
+                        "verification_cancelled",
+                        client_ip=client_ip,
+                        client_port=client_port,
+                        target=self._target.name,
+                        reason=wait_reason,
+                    )
+                    return
                 if not approved:
                     log_with_data(
                         self._logger,
@@ -195,10 +243,24 @@ class TargetProxy:
                         client_ip=client_ip,
                         target=self._target.name,
                     )
+                    self._append_connection_audit(
+                        "verification_timeout",
+                        client_ip=client_ip,
+                        client_port=client_port,
+                        target=self._target.name,
+                        wait_seconds=self._verification_wait_seconds,
+                        reason=wait_reason,
+                    )
                     if self._deny_if_timeout:
                         return
 
             if not self._ensure_instance_running(client_ip):
+                self._append_connection_audit(
+                    "instance_not_ready",
+                    client_ip=client_ip,
+                    client_port=client_port,
+                    target=self._target.name,
+                )
                 return
 
             upstream = socket.create_connection((self._target.target_ip, self._target.target_rdp_port), timeout=10)
@@ -217,6 +279,14 @@ class TargetProxy:
                 target=self._target.name,
                 latency_seconds=round(time.time() - start_ts, 2),
             )
+            self._notifier.on_connection_established(self._target.name)
+            self._append_connection_audit(
+                "forwarding_started",
+                client_ip=client_ip,
+                client_port=client_port,
+                target=self._target.name,
+                latency_seconds=round(time.time() - start_ts, 2),
+            )
 
             forwarding_started = True
             c2u_bytes, u2c_bytes = self._pipe_bidirectional(client, upstream)
@@ -225,6 +295,14 @@ class TargetProxy:
                 logging.INFO,
                 "Forwarding stream ended",
                 client_ip=client_ip,
+                target=self._target.name,
+                client_to_upstream_bytes=c2u_bytes,
+                upstream_to_client_bytes=u2c_bytes,
+            )
+            self._append_connection_audit(
+                "forwarding_ended",
+                client_ip=client_ip,
+                client_port=client_port,
                 target=self._target.name,
                 client_to_upstream_bytes=c2u_bytes,
                 upstream_to_client_bytes=u2c_bytes,
@@ -242,12 +320,28 @@ class TargetProxy:
                 winerror=getattr(exc, "winerror", None),
                 error=str(exc),
             )
+            self._append_connection_audit(
+                "connection_reset",
+                client_ip=client_ip,
+                client_port=client_port,
+                target=self._target.name,
+                errno=getattr(exc, "errno", None),
+                winerror=getattr(exc, "winerror", None),
+                error=str(exc),
+            )
         except Exception as exc:
             log_with_data(
                 self._logger,
                 logging.ERROR,
                 "Connection handling failed",
                 client_ip=client_ip,
+                target=self._target.name,
+                error=str(exc),
+            )
+            self._append_connection_audit(
+                "connection_failed",
+                client_ip=client_ip,
+                client_port=client_port,
                 target=self._target.name,
                 error=str(exc),
             )
@@ -281,6 +375,17 @@ class TargetProxy:
                 target=self._target.name,
                 duration_seconds=round(time.time() - start_ts, 2),
             )
+            self._append_connection_audit(
+                "connection_closed",
+                client_ip=client_ip,
+                client_port=client_port,
+                target=self._target.name,
+                duration_seconds=round(duration_seconds, 2),
+                approved=approved,
+                forwarding_started=forwarding_started,
+                client_to_upstream_bytes=c2u_bytes,
+                upstream_to_client_bytes=u2c_bytes,
+            )
 
             if should_notify:
                 threading.Thread(
@@ -302,6 +407,71 @@ class TargetProxy:
                     reason=reason,
                 )
             self._single_session_lock.release()
+
+    def _wait_for_verification_notify_window(self, client: socket.socket) -> bool:
+        delay_seconds = max(0.0, self._verification_notify_delay_seconds)
+        if delay_seconds <= 0:
+            return True
+
+        deadline = time.time() + delay_seconds
+        while time.time() < deadline:
+            timeout = min(0.2, max(0.0, deadline - time.time()))
+            readable, _, _ = select.select([client], [], [], timeout)
+            if not readable:
+                continue
+            try:
+                peek = client.recv(1, socket.MSG_PEEK)
+            except OSError:
+                return False
+            if not peek:
+                return False
+
+        return True
+
+    def _wait_for_verification_or_disconnect(
+        self,
+        client: socket.socket,
+        event: threading.Event,
+        timeout_seconds: int,
+    ) -> tuple[bool, str]:
+        deadline = time.time() + max(0, timeout_seconds)
+
+        while time.time() < deadline:
+            if event.wait(timeout=0.2):
+                return True, "approved"
+
+            readable, _, _ = select.select([client], [], [], 0)
+            if not readable:
+                continue
+            try:
+                peek = client.recv(1, socket.MSG_PEEK)
+            except OSError:
+                return False, "client_disconnected"
+            if not peek:
+                return False, "client_disconnected"
+
+        return False, "timeout"
+
+    def _append_connection_audit(self, event: str, **fields: object) -> None:
+        now = datetime.now().isoformat(sep=" ", timespec="seconds")
+        payload = sanitize_sensitive_log_fields(dict(fields))
+        pairs = [f"{k}={payload[k]}" for k in sorted(payload.keys())]
+        line = f"{now} event={event}"
+        if pairs:
+            line = f"{line} {' '.join(pairs)}"
+
+        try:
+            with self._connection_log_lock:
+                with self._connection_log_path.open("a", encoding="utf-8") as fp:
+                    fp.write(line + "\n")
+        except OSError as exc:
+            log_with_data(
+                self._logger,
+                logging.WARNING,
+                "Connection audit log write failed",
+                target=self._target.name,
+                error=str(exc),
+            )
 
     def _looks_like_rdp_client_hello(self, client: socket.socket) -> bool:
         deadline = time.time() + self._rdp_probe_timeout_seconds
@@ -763,7 +933,7 @@ class RDPProxyApp:
             on_verified=self._handle_verification_approved,
             on_action=self._handle_post_disconnect_action,
         )
-        self._notifier = Notifier(cfg.notifications)
+        self._notifier = Notifier(cfg.notifications, verification_message_ttl_seconds=cfg.security.token_ttl_seconds)
         self._targets: list[TargetProxy] = [
             TargetProxy(
                 bind_host=cfg.server.bind,
@@ -777,6 +947,8 @@ class RDPProxyApp:
             )
             for t in cfg.targets
         ]
+        for target_proxy in self._targets:
+            target_proxy.set_verification_notify_delay(cfg.security.verification_notify_delay_seconds)
         self._target_by_name = {t._target.name: t for t in self._targets}
 
     def _handle_post_disconnect_action(self, target_name: str, action: str) -> None:

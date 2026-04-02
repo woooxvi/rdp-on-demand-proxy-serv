@@ -125,6 +125,7 @@ sudo systemctl status rdp-proxy
 - `targets[].cloud.stop_mode`: 腾讯云停机模式，建议 `STOP_CHARGING`
 - `targets[].cloud.provider`: `tencent_cvm` 或 `aliyun_ecs`
 - `security.wait_for_verification_seconds`: 等待验证时间
+- `security.verification_notify_delay_seconds`: 验证通知延迟窗口（默认 2 秒）。连接在该窗口内断开时，不发送连接请求通知，可抑制扫描噪声。
 - `notifications.telegram.insecure_skip_verify`: 仅在本机证书链异常时用于调试，`true` 会跳过 Telegram HTTPS 证书校验
 - `notifications.dingtalk.secret`: 钉钉加签密钥，开启机器人加签时必填
 
@@ -132,6 +133,10 @@ sudo systemctl status rdp-proxy
 
 - 所有 `enabled: true` 的通知通道都会并行尝试发送，不会只发一个通道。
 - RDP 连接验证仍按每次连接发送，不会因短时间重连而跳过验证。
+- 连接验证通知会在 `security.verification_notify_delay_seconds` 观察窗口后发送；若连接很快断开，则不发送通知。
+- 如果客户端在等待授权阶段已经断开，该次验证 token 会被立即作废；点击旧链接会提示失效，避免“无意义授权”影响后续连接。
+- Telegram 的“连接验证请求”消息会在验证链接过期后自动尝试删除（默认 5 分钟，与 `security.token_ttl_seconds` 一致）。
+- Telegram 的“连接断开提醒”不会定时删除；当下一次连接真正建立转发后，会自动尝试删除上一条断开提醒。
 - 断开提醒采用 30 秒观察窗口：若断开后 30 秒内出现新连接，会抑制上一条断开提醒，减少“密码阶段二次建连”噪声。
 - 通知中的来源 IP 默认脱敏为“IP 尾号”。
 - 可选开启 `notifications.geoip.enabled` 获取来源城市信息（依赖外部 GeoIP HTTP 接口，失败时自动降级为仅显示 IP 尾号）。
@@ -188,6 +193,12 @@ python run.py --config config.yml --self-check cloud --cloud-check-operation sto
 - 观察日志中的 `Forwarding stats`，确认双向字节是否持续增长。
 - 如果 `client_to_upstream_bytes` 增长而 `upstream_to_client_bytes` 长时间不增长，通常是目标主机会话侧问题（系统负载、组策略、用户配置文件、RDS 服务状态）。
 - 如果两者都停止增长，优先检查链路中间设备会话保持与目标主机事件日志。
+
+连接审计日志：
+
+- 运行时会生成文本审计日志 `logs/connections-<target_name>.log`。
+- 日志覆盖连接建立、验证发送/超时、上游转发开始、连接重置、连接结束等关键阶段，便于排查如 0x904/0x7 这类连接失败。
+- 是否记录敏感 IP 信息遵循 `server.access_log_details`：关闭时自动去除 `client_ip` 等敏感字段。
 
 ## 注意事项
 

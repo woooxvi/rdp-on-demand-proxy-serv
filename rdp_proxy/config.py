@@ -22,6 +22,7 @@ class SecurityConfig:
     token_ttl_seconds: int
     wait_for_verification_seconds: int
     deny_if_timeout: bool
+    verification_notify_delay_seconds: float = 2.0
 
 
 @dataclass(frozen=True)
@@ -197,6 +198,7 @@ def load_config(config_path: str) -> AppConfig:
             token_ttl_seconds=int(security.get("token_ttl_seconds", 300)),
             wait_for_verification_seconds=int(security.get("wait_for_verification_seconds", 300)),
             deny_if_timeout=bool(security.get("deny_if_timeout", True)),
+            verification_notify_delay_seconds=float(security.get("verification_notify_delay_seconds", 2.0)),
         ),
         notifications=NotificationsConfig(
             telegram=TelegramConfig(

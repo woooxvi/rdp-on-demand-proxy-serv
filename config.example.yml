@@ -11,6 +11,7 @@ security:
   token_ttl_seconds: 300
   wait_for_verification_seconds: 300
   deny_if_timeout: true
+  verification_notify_delay_seconds: 2.0
 
 notifications:
   telegram:
