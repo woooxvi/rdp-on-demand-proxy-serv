@@ -198,6 +198,12 @@ python run.py --config config.yml --self-check cloud --cloud-check-operation sto
 
 - 运行时会生成文本审计日志 `logs/connections-<target_name>.log`。
 - 日志覆盖连接建立、验证发送/超时、上游转发开始、连接重置、连接结束等关键阶段，便于排查如 0x904/0x7 这类连接失败。
+- 每次连接会分配 `connection_id`，可据此串联整条会话链路。
+- 新增关键事件：
+  - `verification_wait_started` / `verification_wait_finished`：授权等待起止与耗时。
+  - `connection_aborted`：连接提前结束的阶段与原因（如 `client_disconnected_before_notify_window`、`verification_timeout_deny`、`instance_not_ready`）。
+  - `connection_rejected`：连接被并发策略拒绝（如 `single_session_policy`）。
+- 建议排障时按同一个 `connection_id` 提供完整事件序列（建议从 `connected` 到 `connection_closed` 全部复制）。
 - 是否记录敏感 IP 信息遵循 `server.access_log_details`：关闭时自动去除 `client_ip` 等敏感字段。
 
 ## 注意事项

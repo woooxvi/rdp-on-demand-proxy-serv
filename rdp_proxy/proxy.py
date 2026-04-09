@@ -8,6 +8,7 @@ import time
 from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 from rdp_proxy.cloud.base import CloudProvider
 from rdp_proxy.cloud.factory import create_provider
@@ -132,6 +133,13 @@ class TargetProxy:
                     client_port=client_port,
                     target=self._target.name,
                 )
+                self._append_connection_audit(
+                    "connection_rejected",
+                    client_ip=client_ip,
+                    client_port=client_port,
+                    target=self._target.name,
+                    reason="single_session_policy",
+                )
                 with suppress(OSError):
                     conn.close()
                 continue
@@ -146,6 +154,8 @@ class TargetProxy:
 
     def _handle_connection(self, client: socket.socket, client_ip: str, client_port: int) -> None:
         start_ts = time.time()
+        connection_id = uuid4().hex[:12]
+        stage = "accepted"
         approved = False
         forwarding_started = False
         c2u_bytes = 0
@@ -159,12 +169,14 @@ class TargetProxy:
             self._logger,
             logging.INFO,
             "Client connected",
+            connection_id=connection_id,
             client_ip=client_ip,
             client_port=client_port,
             target=self._target.name,
         )
         self._append_connection_audit(
             "connected",
+            connection_id=connection_id,
             client_ip=client_ip,
             client_port=client_port,
             target=self._target.name,
@@ -172,30 +184,53 @@ class TargetProxy:
 
         upstream: socket.socket | None = None
         try:
+            stage = "probe_rdp_hello"
             if not self._looks_like_rdp_client_hello(client):
                 log_with_data(
                     self._logger,
                     logging.INFO,
                     "Connection dropped by scanner filter",
+                    connection_id=connection_id,
                     client_ip=client_ip,
                     client_port=client_port,
                     target=self._target.name,
                     reason="not_rdp_handshake_or_no_initial_payload",
                 )
+                self._append_connection_audit(
+                    "connection_aborted",
+                    connection_id=connection_id,
+                    client_ip=client_ip,
+                    client_port=client_port,
+                    target=self._target.name,
+                    stage=stage,
+                    reason="not_rdp_handshake_or_no_initial_payload",
+                )
                 return
 
             if self._security_enabled:
+                stage = "notify_delay_window"
                 if not self._wait_for_verification_notify_window(client):
                     self._append_connection_audit(
                         "verification_notify_suppressed",
+                        connection_id=connection_id,
                         client_ip=client_ip,
                         client_port=client_port,
                         target=self._target.name,
                         reason="client_disconnected_before_notify_window",
                         delay_seconds=round(self._verification_notify_delay_seconds, 2),
                     )
+                    self._append_connection_audit(
+                        "connection_aborted",
+                        connection_id=connection_id,
+                        client_ip=client_ip,
+                        client_port=client_port,
+                        target=self._target.name,
+                        stage=stage,
+                        reason="client_disconnected_before_notify_window",
+                    )
                     return
 
+                stage = "create_verification"
                 token, evt, url = self._verification.create_token(
                     {
                         "target": self._target.name,
@@ -208,30 +243,63 @@ class TargetProxy:
                     self._logger,
                     logging.INFO,
                     "Verification sent",
+                    connection_id=connection_id,
                     client_ip=client_ip,
                     token=token,
                     verify_url=url,
                 )
                 self._append_connection_audit(
                     "verification_sent",
+                    connection_id=connection_id,
                     client_ip=client_ip,
                     client_port=client_port,
                     target=self._target.name,
                     token=token,
                     delay_seconds=round(self._verification_notify_delay_seconds, 2),
                 )
+
+                stage = "wait_verification"
+                wait_start_ts = time.time()
+                self._append_connection_audit(
+                    "verification_wait_started",
+                    connection_id=connection_id,
+                    client_ip=client_ip,
+                    client_port=client_port,
+                    target=self._target.name,
+                    wait_seconds=self._verification_wait_seconds,
+                )
                 approved, wait_reason = self._wait_for_verification_or_disconnect(
                     client=client,
                     event=evt,
                     timeout_seconds=self._verification_wait_seconds,
                 )
+                self._append_connection_audit(
+                    "verification_wait_finished",
+                    connection_id=connection_id,
+                    client_ip=client_ip,
+                    client_port=client_port,
+                    target=self._target.name,
+                    approved=approved,
+                    reason=wait_reason,
+                    waited_seconds=round(time.time() - wait_start_ts, 2),
+                )
                 if not approved and wait_reason == "client_disconnected":
                     self._verification.cancel_token(token)
                     self._append_connection_audit(
                         "verification_cancelled",
+                        connection_id=connection_id,
                         client_ip=client_ip,
                         client_port=client_port,
                         target=self._target.name,
+                        reason=wait_reason,
+                    )
+                    self._append_connection_audit(
+                        "connection_aborted",
+                        connection_id=connection_id,
+                        client_ip=client_ip,
+                        client_port=client_port,
+                        target=self._target.name,
+                        stage=stage,
                         reason=wait_reason,
                     )
                     return
@@ -240,11 +308,13 @@ class TargetProxy:
                         self._logger,
                         logging.WARNING,
                         "Verification timeout",
+                        connection_id=connection_id,
                         client_ip=client_ip,
                         target=self._target.name,
                     )
                     self._append_connection_audit(
                         "verification_timeout",
+                        connection_id=connection_id,
                         client_ip=client_ip,
                         client_port=client_port,
                         target=self._target.name,
@@ -252,17 +322,38 @@ class TargetProxy:
                         reason=wait_reason,
                     )
                     if self._deny_if_timeout:
+                        self._append_connection_audit(
+                            "connection_aborted",
+                            connection_id=connection_id,
+                            client_ip=client_ip,
+                            client_port=client_port,
+                            target=self._target.name,
+                            stage=stage,
+                            reason="verification_timeout_deny",
+                        )
                         return
 
+            stage = "ensure_instance_running"
             if not self._ensure_instance_running(client_ip):
                 self._append_connection_audit(
                     "instance_not_ready",
+                    connection_id=connection_id,
                     client_ip=client_ip,
                     client_port=client_port,
                     target=self._target.name,
                 )
+                self._append_connection_audit(
+                    "connection_aborted",
+                    connection_id=connection_id,
+                    client_ip=client_ip,
+                    client_port=client_port,
+                    target=self._target.name,
+                    stage=stage,
+                    reason="instance_not_ready",
+                )
                 return
 
+            stage = "connect_upstream"
             upstream = socket.create_connection((self._target.target_ip, self._target.target_rdp_port), timeout=10)
             client.settimeout(None)
             upstream.settimeout(None)
@@ -275,6 +366,7 @@ class TargetProxy:
                 self._logger,
                 logging.INFO,
                 "Forwarding started",
+                connection_id=connection_id,
                 client_ip=client_ip,
                 target=self._target.name,
                 latency_seconds=round(time.time() - start_ts, 2),
@@ -282,6 +374,7 @@ class TargetProxy:
             self._notifier.on_connection_established(self._target.name)
             self._append_connection_audit(
                 "forwarding_started",
+                connection_id=connection_id,
                 client_ip=client_ip,
                 client_port=client_port,
                 target=self._target.name,
@@ -289,11 +382,13 @@ class TargetProxy:
             )
 
             forwarding_started = True
+            stage = "forwarding"
             c2u_bytes, u2c_bytes = self._pipe_bidirectional(client, upstream)
             log_with_data(
                 self._logger,
                 logging.INFO,
                 "Forwarding stream ended",
+                connection_id=connection_id,
                 client_ip=client_ip,
                 target=self._target.name,
                 client_to_upstream_bytes=c2u_bytes,
@@ -301,6 +396,7 @@ class TargetProxy:
             )
             self._append_connection_audit(
                 "forwarding_ended",
+                connection_id=connection_id,
                 client_ip=client_ip,
                 client_port=client_port,
                 target=self._target.name,
@@ -314,6 +410,8 @@ class TargetProxy:
                 self._logger,
                 logging.WARNING,
                 "Connection reset by peer",
+                connection_id=connection_id,
+                stage=stage,
                 client_ip=client_ip,
                 target=self._target.name,
                 errno=getattr(exc, "errno", None),
@@ -322,6 +420,8 @@ class TargetProxy:
             )
             self._append_connection_audit(
                 "connection_reset",
+                connection_id=connection_id,
+                stage=stage,
                 client_ip=client_ip,
                 client_port=client_port,
                 target=self._target.name,
@@ -334,12 +434,16 @@ class TargetProxy:
                 self._logger,
                 logging.ERROR,
                 "Connection handling failed",
+                connection_id=connection_id,
+                stage=stage,
                 client_ip=client_ip,
                 target=self._target.name,
                 error=str(exc),
             )
             self._append_connection_audit(
                 "connection_failed",
+                connection_id=connection_id,
+                stage=stage,
                 client_ip=client_ip,
                 client_port=client_port,
                 target=self._target.name,
@@ -371,12 +475,16 @@ class TargetProxy:
                 self._logger,
                 logging.INFO,
                 "Forwarding ended",
+                connection_id=connection_id,
+                stage=stage,
                 client_ip=client_ip,
                 target=self._target.name,
                 duration_seconds=round(time.time() - start_ts, 2),
             )
             self._append_connection_audit(
                 "connection_closed",
+                connection_id=connection_id,
+                stage=stage,
                 client_ip=client_ip,
                 client_port=client_port,
                 target=self._target.name,
