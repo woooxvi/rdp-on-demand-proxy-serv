@@ -14,6 +14,10 @@ venv/
 *.log
 *.sqlite3
 
+# GeoIP databases — downloaded by CI/scripts/update_geoip.py, not committed
+data/*.mmdb
+data/*.mmdb.gz
+
 # Secrets and local config
 .env
 .env.*

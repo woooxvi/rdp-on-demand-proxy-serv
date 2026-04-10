@@ -19,6 +19,11 @@ try:
 except ImportError:
     pytz = None
 
+try:
+    import maxminddb
+except ImportError:
+    maxminddb = None
+
 from rdp_proxy.config import NotificationsConfig, TargetConfig
 from rdp_proxy.logging_utils import log_with_data
 
@@ -31,8 +36,58 @@ class Notifier:
         self._telegram_verification_messages: dict[str, list[int]] = {}
         self._telegram_disconnect_messages: dict[str, list[int]] = {}
         self._geoip_cache: dict[str, tuple[float, str]] = {}
+        self._geo_city_reader = None
+        self._geo_asn_reader = None
         self._lock = threading.Lock()
         self._timezone_obj = self._init_timezone()
+        self._init_geoip_readers()
+
+    def _init_geoip_readers(self) -> None:
+        if not self._cfg.geoip.enabled:
+            return
+        if self._cfg.geoip.mode != "offline":
+            return
+
+        if maxminddb is None:
+            log_with_data(
+                self._logger,
+                logging.WARNING,
+                "GeoIP offline mode requires maxminddb package",
+            )
+            return
+
+        city_path = self._cfg.geoip.city_db_path
+        asn_path = self._cfg.geoip.asn_db_path
+
+        if city_path:
+            try:
+                self._geo_city_reader = maxminddb.open_database(city_path)
+            except Exception as exc:
+                log_with_data(
+                    self._logger,
+                    logging.WARNING,
+                    "GeoIP city database open failed",
+                    error=str(exc),
+                )
+
+        if asn_path:
+            try:
+                self._geo_asn_reader = maxminddb.open_database(asn_path)
+            except Exception as exc:
+                log_with_data(
+                    self._logger,
+                    logging.WARNING,
+                    "GeoIP ASN database open failed",
+                    error=str(exc),
+                )
+
+        log_with_data(
+            self._logger,
+            logging.INFO,
+            "GeoIP offline readers initialized",
+            city_reader_ready=self._geo_city_reader is not None,
+            asn_reader_ready=self._geo_asn_reader is not None,
+        )
 
     def _init_timezone(self):
         """Initialize timezone object based on config."""
@@ -398,9 +453,9 @@ class Notifier:
 
     def _format_origin(self, client_ip: str) -> str:
         masked = self._mask_ip(client_ip) if self._cfg.privacy.mask_client_ip else client_ip
-        city = self._resolve_city(client_ip)
-        if city:
-            return f"IP尾号 {masked} ({city})"
+        geo = self._resolve_geo_text(client_ip)
+        if geo:
+            return f"IP尾号 {masked} ({geo})"
         return f"IP尾号 {masked}"
 
     def _mask_ip(self, client_ip: str) -> str:
@@ -417,7 +472,7 @@ class Notifier:
         exploded = ip_obj.exploded.split(":")
         return exploded[-1][-4:]
 
-    def _resolve_city(self, client_ip: str) -> str:
+    def _resolve_geo_text(self, client_ip: str) -> str:
         if not self._cfg.geoip.enabled:
             return ""
 
@@ -427,11 +482,72 @@ class Notifier:
             if cached and cached[0] >= now:
                 return cached[1]
 
-        city_text = self._lookup_city_online(client_ip)
+        if self._cfg.geoip.mode == "offline":
+            geo_text = self._lookup_geo_offline(client_ip)
+        else:
+            geo_text = self._lookup_city_online(client_ip)
+
         expire_at = now + max(1, self._cfg.geoip.cache_ttl_seconds)
         with self._lock:
-            self._geoip_cache[client_ip] = (expire_at, city_text)
-        return city_text
+            self._geoip_cache[client_ip] = (expire_at, geo_text)
+        return geo_text
+
+    def _lookup_geo_offline(self, client_ip: str) -> str:
+        city_part = ""
+        asn_part = ""
+
+        if self._geo_city_reader is not None:
+            try:
+                city_data = self._geo_city_reader.get(client_ip)
+            except Exception:
+                city_data = None
+            if isinstance(city_data, dict):
+                city_name = self._pick_localized_name(city_data.get("city"))
+                region_name = ""
+                subdivisions = city_data.get("subdivisions")
+                if isinstance(subdivisions, list) and subdivisions:
+                    region_name = self._pick_localized_name(subdivisions[0])
+                country_name = self._pick_localized_name(city_data.get("country"))
+                parts = [p for p in [city_name, region_name, country_name] if p]
+                if parts:
+                    city_part = "/".join(parts)
+
+        if self._geo_asn_reader is not None:
+            try:
+                asn_data = self._geo_asn_reader.get(client_ip)
+            except Exception:
+                asn_data = None
+            if isinstance(asn_data, dict):
+                asn_number = asn_data.get("autonomous_system_number")
+                asn_org = str(asn_data.get("autonomous_system_organization", "")).strip()
+                if asn_number and asn_org:
+                    asn_part = f"AS{asn_number} {asn_org}"
+                elif asn_number:
+                    asn_part = f"AS{asn_number}"
+                elif asn_org:
+                    asn_part = asn_org
+
+        if city_part and asn_part:
+            return f"{city_part} | {asn_part}"
+        if city_part:
+            return city_part
+        return asn_part
+
+    def _pick_localized_name(self, section: object) -> str:
+        if not isinstance(section, dict):
+            return ""
+        names = section.get("names")
+        if not isinstance(names, dict):
+            return ""
+        for key in ("zh-CN", "zh", "en"):
+            value = str(names.get(key, "")).strip()
+            if value:
+                return value
+        for value in names.values():
+            text = str(value).strip()
+            if text:
+                return text
+        return ""
 
     def _lookup_city_online(self, client_ip: str) -> str:
         endpoints = self._build_geoip_endpoints(client_ip)
@@ -449,8 +565,6 @@ class Notifier:
                     self._logger,
                     logging.WARNING,
                     "GeoIP lookup failed on endpoint",
-                    client_ip=client_ip,
-                    endpoint=endpoint,
                     error=str(exc),
                 )
                 continue

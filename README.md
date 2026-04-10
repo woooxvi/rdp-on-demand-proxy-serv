@@ -139,9 +139,13 @@ sudo systemctl status rdp-proxy
 - Telegram 的“连接断开提醒”不会定时删除；当下一次连接真正建立转发后，会自动尝试删除上一条断开提醒。
 - 断开提醒采用 30 秒观察窗口：若断开后 30 秒内出现新连接，会抑制上一条断开提醒，减少“密码阶段二次建连”噪声。
 - 通知中的来源 IP 默认脱敏为“IP 尾号”。
-- 可选开启 `notifications.geoip.enabled` 获取来源城市信息（依赖外部 GeoIP HTTP 接口，失败时自动降级为仅显示 IP 尾号）。
-- `notifications.geoip.endpoint_templates` 支持配置多个 GeoIP 接口地址，按顺序自动回退：前一个不可达/被拦截时会尝试下一个。
+- 可选开启 `notifications.geoip.enabled` 获取来源城市 + ASN 信息，推荐离线模式：`notifications.geoip.mode=offline`。
+- 离线模式需要本地数据库文件：`notifications.geoip.city_db_path`（GeoLite2-City.mmdb）与 `notifications.geoip.asn_db_path`（GeoLite2-ASN.mmdb）。
+- 兼容在线模式：`notifications.geoip.mode=online` 时仍支持 `endpoint_templates` 回退查询。
 - 保持向后兼容：如果仍使用单个 `endpoint_template` 字段，也可正常工作。
+- 本项目 Docker 镜像内置 GeoLite2 数据库，无需自行下载即可直接使用。
+- 若需手动更新数据库，免费注册 MaxMind 账号后，在 `config.yml` 的 `notifications.geoip.update` 填入凭据，
+  然后运行：`python scripts/update_geoip.py --config config.yml`
 
 连接噪声识别策略：
 
@@ -205,6 +209,7 @@ python run.py --config config.yml --self-check cloud --cloud-check-operation sto
   - `connection_rejected`：连接被并发策略拒绝（如 `single_session_policy`）。
 - 建议排障时按同一个 `connection_id` 提供完整事件序列（建议从 `connected` 到 `connection_closed` 全部复制）。
 - 是否记录敏感 IP 信息遵循 `server.access_log_details`：关闭时自动去除 `client_ip` 等敏感字段。
+- 若不希望在日志中落地来源 IP，建议显式设置 `server.access_log_details: false`。
 
 ## 注意事项
 
@@ -213,3 +218,8 @@ python run.py --config config.yml --self-check cloud --cloud-check-operation sto
 - 当前并发策略：允许多个连接同时进入“待授权”阶段（默认最多 5 条、同源 IP 最多 1 条），但同一目标同一时刻只放通 1 条转发会话。
 - 当某条连接被授权后，会清理其他不同 IP 的待授权连接，避免恶意占坑导致长期阻塞。
 - 如果需要 YAML 配置，请额外安装 `PyYAML`。
+
+## 第三方数据来源
+
+本项目 Docker 镜像包含 GeoLite2 数据库，创建者 MaxMind，来源 [https://www.maxmind.com](https://www.maxmind.com)。  
+GeoLite2 数据库依据 [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/) 授权发布，分发时须保留本署名。

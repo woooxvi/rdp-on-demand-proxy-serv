@@ -54,6 +54,9 @@ class NotificationPrivacyConfig:
 @dataclass(frozen=True)
 class GeoIPConfig:
     enabled: bool = False
+    mode: str = "offline"
+    city_db_path: str = ""
+    asn_db_path: str = ""
     endpoint_templates: tuple[str, ...] = (
         "https://ipwho.is/{ip}",
         "https://ipapi.co/{ip}/json/",
@@ -61,6 +64,8 @@ class GeoIPConfig:
     )
     timeout_seconds: float = 2.0
     cache_ttl_seconds: int = 3600
+    update_account_id: str = ""
+    update_license_key: str = ""
 
 
 @dataclass(frozen=True)
@@ -129,6 +134,7 @@ def load_config(config_path: str) -> AppConfig:
     security = raw["security"]
     notifications = raw["notifications"]
     geoip_raw = notifications.get("geoip", {})
+    geoip_update_raw = geoip_raw.get("update", {})
 
     endpoint_templates_raw = geoip_raw.get("endpoint_templates")
     endpoint_templates: tuple[str, ...]
@@ -221,9 +227,14 @@ def load_config(config_path: str) -> AppConfig:
             ),
             geoip=GeoIPConfig(
                 enabled=bool(geoip_raw.get("enabled", False)),
+                mode=str(geoip_raw.get("mode", "offline")).strip().lower() or "offline",
+                city_db_path=str(geoip_raw.get("city_db_path", "")).strip(),
+                asn_db_path=str(geoip_raw.get("asn_db_path", "")).strip(),
                 endpoint_templates=endpoint_templates,
                 timeout_seconds=float(geoip_raw.get("timeout_seconds", 2.0)),
                 cache_ttl_seconds=int(geoip_raw.get("cache_ttl_seconds", 3600)),
+                update_account_id=str(geoip_update_raw.get("account_id", "")).strip(),
+                update_license_key=str(geoip_update_raw.get("license_key", "")).strip(),
             ),
             timezone=str(notifications.get("timezone", "server")).strip(),
         ),

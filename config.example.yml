@@ -4,7 +4,7 @@ server:
   verify_http_port: 8080
   external_verify_base_url: http://YOUR_PROXY_PUBLIC_IP:8080
   max_pending_connections: 50
-  access_log_details: true
+  access_log_details: false
 
 security:
   enabled: true
@@ -30,13 +30,22 @@ notifications:
   privacy:
     mask_client_ip: true
   geoip:
-    enabled: false
+    enabled: true
+    mode: offline
+    city_db_path: ./data/GeoLite2-City.mmdb
+    asn_db_path: ./data/GeoLite2-ASN.mmdb
+    # mode=online 时可选以下回退接口（不推荐）
     endpoint_templates:
       - https://ipwho.is/{ip}
       - https://ipapi.co/{ip}/json/
       - http://ip-api.com/json/{ip}?fields=status,country,regionName,city
     timeout_seconds: 2.0
     cache_ttl_seconds: 3600
+    # 可选：填入你自己的 MaxMind 账号，用于本地执行 scripts/update_geoip.py 更新数据库
+    # 免费注册: https://www.maxmind.com/en/geolite2/signup
+    # update:
+    #   account_id: ""
+    #   license_key: ""
 
 targets:
   - name: win-workstation-01

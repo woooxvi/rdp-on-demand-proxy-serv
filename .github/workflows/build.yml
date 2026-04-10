@@ -15,6 +15,22 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Download GeoLite2 databases
+        env:
+          MAXMIND_ACCOUNT_ID: ${{ secrets.MAXMIND_ACCOUNT_ID }}
+          MAXMIND_LICENSE_KEY: ${{ secrets.MAXMIND_LICENSE_KEY }}
+        run: |
+          if [ -n "$MAXMIND_ACCOUNT_ID" ] && [ -n "$MAXMIND_LICENSE_KEY" ]; then
+            python scripts/update_geoip.py \
+              --account-id "$MAXMIND_ACCOUNT_ID" \
+              --license-key "$MAXMIND_LICENSE_KEY"
+          else
+            echo "::warning::MAXMIND_ACCOUNT_ID or MAXMIND_LICENSE_KEY not set; GeoIP databases will not be bundled"
+          fi
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
