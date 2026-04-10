@@ -24,6 +24,7 @@ import os
 import sys
 import tarfile
 import tempfile
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -32,20 +33,35 @@ logger = logging.getLogger("geoip_update")
 
 _EDITIONS = ["GeoLite2-City", "GeoLite2-ASN"]
 _DOWNLOAD_URL = "https://download.maxmind.com/geoip/databases/{edition}/download?suffix=tar.gz"
+_LEGACY_DOWNLOAD_URL = "https://download.maxmind.com/app/geoip_download?edition_id={edition}&license_key={license_key}&suffix=tar.gz"
+
+_MIRROR_URLS = {
+    "GeoLite2-City": (
+        "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-City.mmdb",
+        "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-City.mmdb",
+    ),
+    "GeoLite2-ASN": (
+        "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-ASN.mmdb",
+        "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-ASN.mmdb",
+    ),
+}
 
 
-def download_edition(edition: str, account_id: str, license_key: str, output_path: Path) -> None:
-    url = _DOWNLOAD_URL.format(edition=edition)
-    cred = base64.b64encode(f"{account_id}:{license_key}".encode()).decode()
-    req = urllib.request.Request(
-        url,
-        headers={
-            "Authorization": f"Basic {cred}",
-            "User-Agent": "GeoIP-Update/6.0.0 (linux; x86_64)",
-        },
-    )
-    logger.info(f"Downloading {edition} ...")
+def _extract_mmdb_from_targz(targz_path: str, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(targz_path) as tar:
+        for member in tar.getmembers():
+            if member.name.endswith(".mmdb"):
+                file_obj = tar.extractfile(member)
+                if file_obj is not None:
+                    output_path.write_bytes(file_obj.read())
+                    logger.info(f"  -> {output_path} ({output_path.stat().st_size:,} bytes)")
+                    return
+        raise RuntimeError("No .mmdb file found in downloaded archive")
 
+
+def _download_targz_and_extract(url: str, headers: dict[str, str], output_path: Path) -> None:
+    req = urllib.request.Request(url, headers=headers)
     fd, tmp_path = tempfile.mkstemp(suffix=".tar.gz")
     try:
         os.close(fd)
@@ -56,23 +72,63 @@ def download_edition(edition: str, account_id: str, license_key: str, output_pat
                     if not chunk:
                         break
                     f.write(chunk)
-
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        with tarfile.open(tmp_path) as tar:
-            for member in tar.getmembers():
-                if member.name.endswith(".mmdb"):
-                    file_obj = tar.extractfile(member)
-                    if file_obj is not None:
-                        output_path.write_bytes(file_obj.read())
-                        logger.info(f"  -> {output_path} ({output_path.stat().st_size:,} bytes)")
-                        return
-            raise RuntimeError(f"No .mmdb file found in archive for {edition}")
+        _extract_mmdb_from_targz(tmp_path, output_path)
     finally:
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
+
+
+def _download_raw_mmdb(url: str, output_path: Path) -> None:
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        output_path.write_bytes(resp.read())
+    if output_path.stat().st_size < 1024 * 1024:
+        raise RuntimeError(f"Downloaded file too small: {output_path.stat().st_size} bytes")
+    logger.info(f"  -> {output_path} ({output_path.stat().st_size:,} bytes)")
+
+
+def download_edition(edition: str, account_id: str, license_key: str, output_path: Path) -> None:
+    logger.info(f"Downloading {edition} ...")
+    errors: list[str] = []
+
+    try:
+        url = _DOWNLOAD_URL.format(edition=edition)
+        cred = base64.b64encode(f"{account_id}:{license_key}".encode()).decode()
+        _download_targz_and_extract(
+            url,
+            headers={
+                "Authorization": f"Basic {cred}",
+                "User-Agent": "GeoIP-Update/6.0.0 (linux; x86_64)",
+            },
+            output_path=output_path,
+        )
+        return
+    except Exception as exc:
+        errors.append(f"MaxMind auth API failed: {exc}")
+
+    try:
+        legacy_url = _LEGACY_DOWNLOAD_URL.format(edition=edition, license_key=license_key)
+        _download_targz_and_extract(
+            legacy_url,
+            headers={"User-Agent": "GeoIP-Update/6.0.0 (linux; x86_64)"},
+            output_path=output_path,
+        )
+        return
+    except Exception as exc:
+        errors.append(f"MaxMind legacy API failed: {exc}")
+
+    for mirror_url in _MIRROR_URLS.get(edition, ()): 
+        try:
+            _download_raw_mmdb(mirror_url, output_path)
+            logger.warning(f"Downloaded {edition} from mirror fallback")
+            return
+        except Exception as exc:
+            errors.append(f"Mirror failed ({mirror_url}): {exc}")
+
+    raise RuntimeError("; ".join(errors))
 
 
 def main() -> None:
@@ -128,14 +184,22 @@ def main() -> None:
     }
 
     errors = 0
+    success = 0
     for edition, output_path in targets.items():
         try:
             download_edition(edition, account_id, license_key, output_path)
+            success += 1
         except Exception as exc:
             logger.error(f"Failed to download {edition}: {exc}")
             errors += 1
 
-    sys.exit(1 if errors else 0)
+    if success == 0:
+        logger.error("No GeoIP database downloaded successfully")
+        sys.exit(1)
+
+    if errors:
+        logger.warning("Downloaded partially: some databases failed, but at least one is available")
+    sys.exit(0)
 
 
 if __name__ == "__main__":

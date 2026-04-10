@@ -27,7 +27,8 @@ jobs:
           if [ -n "$MAXMIND_ACCOUNT_ID" ] && [ -n "$MAXMIND_LICENSE_KEY" ]; then
             python scripts/update_geoip.py \
               --account-id "$MAXMIND_ACCOUNT_ID" \
-              --license-key "$MAXMIND_LICENSE_KEY"
+              --license-key "$MAXMIND_LICENSE_KEY" || \
+              echo "::warning::GeoLite2 download failed; continue build without bundled GeoIP DB"
           else
             echo "::warning::MAXMIND_ACCOUNT_ID or MAXMIND_LICENSE_KEY not set; GeoIP databases will not be bundled"
           fi
