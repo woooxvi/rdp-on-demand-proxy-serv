@@ -66,6 +66,9 @@ class TargetProxy:
         self._connection_log_lock = threading.Lock()
         self._connection_log_path = Path("logs") / f"connections-{self._target.name}.log"
         self._connection_log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._pending_verifications: dict[str, dict[str, object]] = {}
+        self._max_pending_verification_connections = 5
+        self._max_pending_verifications_per_ip = 1
 
     def set_verification_notify_delay(self, delay_seconds: float) -> None:
         self._verification_notify_delay_seconds = max(0.0, float(delay_seconds))
@@ -124,26 +127,6 @@ class TargetProxy:
                 break
 
             client_ip, client_port = addr[0], addr[1]
-            if not self._single_session_lock.acquire(blocking=False):
-                log_with_data(
-                    self._logger,
-                    logging.WARNING,
-                    "Connection rejected due to single-session policy",
-                    client_ip=client_ip,
-                    client_port=client_port,
-                    target=self._target.name,
-                )
-                self._append_connection_audit(
-                    "connection_rejected",
-                    client_ip=client_ip,
-                    client_port=client_port,
-                    target=self._target.name,
-                    reason="single_session_policy",
-                )
-                with suppress(OSError):
-                    conn.close()
-                continue
-
             t = threading.Thread(
                 target=self._handle_connection,
                 args=(conn, client_ip, client_port),
@@ -152,12 +135,69 @@ class TargetProxy:
             )
             t.start()
 
+    def _register_pending_verification(
+        self,
+        connection_id: str,
+        client: socket.socket,
+        client_ip: str,
+        client_port: int,
+    ) -> tuple[bool, str]:
+        with self._state_lock:
+            pending_total = len(self._pending_verifications)
+            pending_for_ip = sum(1 for p in self._pending_verifications.values() if p.get("client_ip") == client_ip)
+            if pending_total >= self._max_pending_verification_connections:
+                return False, "pending_pool_full"
+            if pending_for_ip >= self._max_pending_verifications_per_ip:
+                return False, "pending_per_ip_limit"
+            self._pending_verifications[connection_id] = {
+                "socket": client,
+                "client_ip": client_ip,
+                "client_port": client_port,
+            }
+        return True, "registered"
+
+    def _unregister_pending_verification(self, connection_id: str) -> None:
+        with self._state_lock:
+            self._pending_verifications.pop(connection_id, None)
+
+    def _evict_other_pending_verifications(self, approved_connection_id: str, approved_client_ip: str) -> int:
+        to_evict: list[tuple[str, socket.socket, str, int]] = []
+        with self._state_lock:
+            for conn_id, payload in list(self._pending_verifications.items()):
+                if conn_id == approved_connection_id:
+                    continue
+                client_ip = str(payload.get("client_ip", ""))
+                if client_ip == approved_client_ip:
+                    continue
+                sock = payload.get("socket")
+                client_port = int(payload.get("client_port", 0))
+                if isinstance(sock, socket.socket):
+                    to_evict.append((conn_id, sock, client_ip, client_port))
+                self._pending_verifications.pop(conn_id, None)
+
+        for conn_id, sock, client_ip, client_port in to_evict:
+            with suppress(OSError):
+                sock.shutdown(socket.SHUT_RDWR)
+            with suppress(OSError):
+                sock.close()
+            self._append_connection_audit(
+                "connection_rejected",
+                connection_id=conn_id,
+                client_ip=client_ip,
+                client_port=client_port,
+                target=self._target.name,
+                reason="superseded_by_approved_connection",
+            )
+        return len(to_evict)
+
     def _handle_connection(self, client: socket.socket, client_ip: str, client_port: int) -> None:
         start_ts = time.time()
         connection_id = uuid4().hex[:12]
         stage = "accepted"
         approved = False
         forwarding_started = False
+        pending_registered = False
+        forwarding_slot_acquired = False
         c2u_bytes = 0
         u2c_bytes = 0
         with self._state_lock:
@@ -231,6 +271,23 @@ class TargetProxy:
                     return
 
                 stage = "create_verification"
+                can_wait, queue_reason = self._register_pending_verification(
+                    connection_id=connection_id,
+                    client=client,
+                    client_ip=client_ip,
+                    client_port=client_port,
+                )
+                if not can_wait:
+                    self._append_connection_audit(
+                        "connection_rejected",
+                        connection_id=connection_id,
+                        client_ip=client_ip,
+                        client_port=client_port,
+                        target=self._target.name,
+                        reason=queue_reason,
+                    )
+                    return
+                pending_registered = True
                 token, evt, url = self._verification.create_token(
                     {
                         "target": self._target.name,
@@ -332,6 +389,33 @@ class TargetProxy:
                             reason="verification_timeout_deny",
                         )
                         return
+
+                if approved:
+                    evicted = self._evict_other_pending_verifications(connection_id, client_ip)
+                    if evicted > 0:
+                        self._append_connection_audit(
+                            "pending_peers_rejected",
+                            connection_id=connection_id,
+                            client_ip=client_ip,
+                            client_port=client_port,
+                            target=self._target.name,
+                            rejected_count=evicted,
+                        )
+
+                self._unregister_pending_verification(connection_id)
+                pending_registered = False
+
+            if not self._single_session_lock.acquire(blocking=False):
+                self._append_connection_audit(
+                    "connection_rejected",
+                    connection_id=connection_id,
+                    client_ip=client_ip,
+                    client_port=client_port,
+                    target=self._target.name,
+                    reason="forwarding_slot_busy",
+                )
+                return
+            forwarding_slot_acquired = True
 
             stage = "ensure_instance_running"
             if not self._ensure_instance_running(client_ip):
@@ -450,6 +534,8 @@ class TargetProxy:
                 error=str(exc),
             )
         finally:
+            if pending_registered:
+                self._unregister_pending_verification(connection_id)
             with suppress(OSError):
                 client.close()
             if upstream:
@@ -462,6 +548,9 @@ class TargetProxy:
                 self._disconnect_notify_generation += 1
                 disconnect_generation = self._disconnect_notify_generation
                 previous_action = self._idle_action
+
+            if forwarding_slot_acquired:
+                self._single_session_lock.release()
 
             duration_seconds = time.time() - start_ts
             should_notify, reason = self._should_send_disconnect_notification(
@@ -514,7 +603,6 @@ class TargetProxy:
                     upstream_to_client_bytes=u2c_bytes,
                     reason=reason,
                 )
-            self._single_session_lock.release()
 
     def _wait_for_verification_notify_window(self, client: socket.socket) -> bool:
         delay_seconds = max(0.0, self._verification_notify_delay_seconds)

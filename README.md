@@ -210,5 +210,6 @@ python run.py --config config.yml --self-check cloud --cloud-check-operation sto
 
 - 默认实现为“先验证后开机”，可减少误触发开机成本。
 - `verify_http_port` 与 RDP 端口通常应分离；HTTP 验证链接需可公网访问。
-- 当前并发策略是单目标同一时刻只处理一个连接。
+- 当前并发策略：允许多个连接同时进入“待授权”阶段（默认最多 5 条、同源 IP 最多 1 条），但同一目标同一时刻只放通 1 条转发会话。
+- 当某条连接被授权后，会清理其他不同 IP 的待授权连接，避免恶意占坑导致长期阻塞。
 - 如果需要 YAML 配置，请额外安装 `PyYAML`。
