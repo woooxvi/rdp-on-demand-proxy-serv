@@ -69,6 +69,7 @@ class TargetProxy:
         self._pending_verifications: dict[str, dict[str, object]] = {}
         self._max_pending_verification_connections = 5
         self._max_pending_verifications_per_ip = 1
+        self._forwarding_slot_wait_seconds = 20
 
     def set_verification_notify_delay(self, delay_seconds: float) -> None:
         self._verification_notify_delay_seconds = max(0.0, float(delay_seconds))
@@ -159,36 +160,6 @@ class TargetProxy:
     def _unregister_pending_verification(self, connection_id: str) -> None:
         with self._state_lock:
             self._pending_verifications.pop(connection_id, None)
-
-    def _evict_other_pending_verifications(self, approved_connection_id: str, approved_client_ip: str) -> int:
-        to_evict: list[tuple[str, socket.socket, str, int]] = []
-        with self._state_lock:
-            for conn_id, payload in list(self._pending_verifications.items()):
-                if conn_id == approved_connection_id:
-                    continue
-                client_ip = str(payload.get("client_ip", ""))
-                if client_ip == approved_client_ip:
-                    continue
-                sock = payload.get("socket")
-                client_port = int(payload.get("client_port", 0))
-                if isinstance(sock, socket.socket):
-                    to_evict.append((conn_id, sock, client_ip, client_port))
-                self._pending_verifications.pop(conn_id, None)
-
-        for conn_id, sock, client_ip, client_port in to_evict:
-            with suppress(OSError):
-                sock.shutdown(socket.SHUT_RDWR)
-            with suppress(OSError):
-                sock.close()
-            self._append_connection_audit(
-                "connection_rejected",
-                connection_id=conn_id,
-                client_ip=client_ip,
-                client_port=client_port,
-                target=self._target.name,
-                reason="superseded_by_approved_connection",
-            )
-        return len(to_evict)
 
     def _handle_connection(self, client: socket.socket, client_ip: str, client_port: int) -> None:
         start_ts = time.time()
@@ -390,29 +361,23 @@ class TargetProxy:
                         )
                         return
 
-                if approved:
-                    evicted = self._evict_other_pending_verifications(connection_id, client_ip)
-                    if evicted > 0:
-                        self._append_connection_audit(
-                            "pending_peers_rejected",
-                            connection_id=connection_id,
-                            client_ip=client_ip,
-                            client_port=client_port,
-                            target=self._target.name,
-                            rejected_count=evicted,
-                        )
-
                 self._unregister_pending_verification(connection_id)
                 pending_registered = False
 
-            if not self._single_session_lock.acquire(blocking=False):
+            stage = "wait_forwarding_slot"
+            lock_ok, lock_reason = self._acquire_forwarding_slot_or_disconnect(
+                client=client,
+                timeout_seconds=self._forwarding_slot_wait_seconds,
+            )
+            if not lock_ok:
                 self._append_connection_audit(
-                    "connection_rejected",
+                    "connection_aborted",
                     connection_id=connection_id,
                     client_ip=client_ip,
                     client_port=client_port,
                     target=self._target.name,
-                    reason="forwarding_slot_busy",
+                    stage=stage,
+                    reason=lock_reason,
                 )
                 return
             forwarding_slot_acquired = True
@@ -647,6 +612,29 @@ class TargetProxy:
                 return False, "client_disconnected"
 
         return False, "timeout"
+
+    def _acquire_forwarding_slot_or_disconnect(
+        self,
+        client: socket.socket,
+        timeout_seconds: int,
+    ) -> tuple[bool, str]:
+        deadline = time.time() + max(0, timeout_seconds)
+
+        while time.time() < deadline:
+            if self._single_session_lock.acquire(blocking=False):
+                return True, "acquired"
+
+            readable, _, _ = select.select([client], [], [], 0.2)
+            if not readable:
+                continue
+            try:
+                peek = client.recv(1, socket.MSG_PEEK)
+            except OSError:
+                return False, "client_disconnected_while_waiting_forwarding_slot"
+            if not peek:
+                return False, "client_disconnected_while_waiting_forwarding_slot"
+
+        return False, "forwarding_slot_busy_timeout"
 
     def _append_connection_audit(self, event: str, **fields: object) -> None:
         now = datetime.now().isoformat(sep=" ", timespec="seconds")
