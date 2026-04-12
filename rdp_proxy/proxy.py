@@ -142,20 +142,44 @@ class TargetProxy:
         client: socket.socket,
         client_ip: str,
         client_port: int,
-    ) -> tuple[bool, str]:
+    ) -> tuple[bool, str, dict[str, object] | None]:
+        replaced: dict[str, object] | None = None
+        replaced_sock: socket.socket | None = None
         with self._state_lock:
             pending_total = len(self._pending_verifications)
-            pending_for_ip = sum(1 for p in self._pending_verifications.values() if p.get("client_ip") == client_ip)
+            same_ip_entries = [
+                (conn_id, payload)
+                for conn_id, payload in self._pending_verifications.items()
+                if payload.get("client_ip") == client_ip
+            ]
+            pending_for_ip = len(same_ip_entries)
             if pending_total >= self._max_pending_verification_connections:
-                return False, "pending_pool_full"
-            if pending_for_ip >= self._max_pending_verifications_per_ip:
-                return False, "pending_per_ip_limit"
+                return False, "pending_pool_full", None
+            if pending_for_ip >= self._max_pending_verifications_per_ip and same_ip_entries:
+                old_conn_id, old_payload = same_ip_entries[0]
+                replaced = {
+                    "connection_id": old_conn_id,
+                    "client_ip": str(old_payload.get("client_ip", "")),
+                    "client_port": int(old_payload.get("client_port", 0)),
+                }
+                old_sock = old_payload.get("socket")
+                if isinstance(old_sock, socket.socket):
+                    replaced_sock = old_sock
+                self._pending_verifications.pop(old_conn_id, None)
             self._pending_verifications[connection_id] = {
                 "socket": client,
                 "client_ip": client_ip,
                 "client_port": client_port,
             }
-        return True, "registered"
+
+        if replaced_sock is not None:
+            with suppress(OSError):
+                replaced_sock.shutdown(socket.SHUT_RDWR)
+            with suppress(OSError):
+                replaced_sock.close()
+            return True, "registered_with_same_ip_takeover", replaced
+
+        return True, "registered", None
 
     def _unregister_pending_verification(self, connection_id: str) -> None:
         with self._state_lock:
@@ -242,7 +266,7 @@ class TargetProxy:
                     return
 
                 stage = "create_verification"
-                can_wait, queue_reason = self._register_pending_verification(
+                can_wait, queue_reason, replaced = self._register_pending_verification(
                     connection_id=connection_id,
                     client=client,
                     client_ip=client_ip,
@@ -258,6 +282,16 @@ class TargetProxy:
                         reason=queue_reason,
                     )
                     return
+                if replaced:
+                    self._append_connection_audit(
+                        "pending_replaced_same_ip",
+                        connection_id=connection_id,
+                        client_ip=client_ip,
+                        client_port=client_port,
+                        target=self._target.name,
+                        replaced_connection_id=str(replaced.get("connection_id", "")),
+                        replaced_client_port=int(replaced.get("client_port", 0)),
+                    )
                 pending_registered = True
                 token, evt, url = self._verification.create_token(
                     {
