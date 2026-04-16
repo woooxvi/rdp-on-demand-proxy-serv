@@ -126,6 +126,11 @@ sudo systemctl status rdp-proxy
 - `targets[].cloud.provider`: `tencent_cvm` 或 `aliyun_ecs`
 - `security.wait_for_verification_seconds`: 等待验证时间
 - `security.verification_notify_delay_seconds`: 验证通知延迟窗口（默认 2 秒）。连接在该窗口内断开时，不发送连接请求通知，可抑制扫描噪声。
+- `security.max_pending_verification_connections`: 待授权连接池总上限（默认 5）。
+- `security.max_pending_verifications_per_ip`: 同源 IP 待授权并发上限（默认 1）。
+- `security.approved_ip_reuse_seconds`: 某 IP 授权成功后，N 秒内新连接免二次授权（默认 60）。
+- `security.per_ip_connection_rate_window_seconds`: 同源 IP 新建连接限流窗口秒数（默认 5）。
+- `security.per_ip_connection_rate_limit`: 同源 IP 每个窗口允许的新建连接数（默认 4）。超出后连接会等待到下一个窗口再继续。
 - `notifications.telegram.insecure_skip_verify`: 仅在本机证书链异常时用于调试，`true` 会跳过 Telegram HTTPS 证书校验
 - `notifications.dingtalk.secret`: 钉钉加签密钥，开启机器人加签时必填
 
@@ -203,10 +208,13 @@ python run.py --config config.yml --self-check cloud --cloud-check-operation sto
 - 运行时会生成文本审计日志 `logs/connections-<target_name>.log`。
 - 日志覆盖连接建立、验证发送/超时、上游转发开始、连接重置、连接结束等关键阶段，便于排查如 0x904/0x7 这类连接失败。
 - 每次连接会分配 `connection_id`，可据此串联整条会话链路。
+- 审计日志默认不记录客户端 IP，仅保留 `connection_id`、端口、阶段、原因、字节统计等信息。
 - 新增关键事件：
   - `verification_wait_started` / `verification_wait_finished`：授权等待起止与耗时。
   - `connection_aborted`：连接提前结束的阶段与原因（如 `client_disconnected_before_notify_window`、`verification_timeout_deny`、`instance_not_ready`）。
   - `connection_rejected`：连接被并发策略拒绝（如 `single_session_policy`）。
+  - `verification_bypassed_recent_approval`：命中“同 IP 近期已授权”直通放行。
+  - `rate_limit_wait`：命中同 IP 新建连接限流，等待到下一窗口。
 - 建议排障时按同一个 `connection_id` 提供完整事件序列（建议从 `connected` 到 `connection_closed` 全部复制）。
 - 是否记录敏感 IP 信息遵循 `server.access_log_details`：关闭时自动去除 `client_ip` 等敏感字段。
 - 若不希望在日志中落地来源 IP，建议显式设置 `server.access_log_details: false`。

@@ -23,6 +23,11 @@ class SecurityConfig:
     wait_for_verification_seconds: int
     deny_if_timeout: bool
     verification_notify_delay_seconds: float = 2.0
+    max_pending_verification_connections: int = 5
+    max_pending_verifications_per_ip: int = 1
+    approved_ip_reuse_seconds: int = 60
+    per_ip_connection_rate_window_seconds: int = 5
+    per_ip_connection_rate_limit: int = 4
 
 
 @dataclass(frozen=True)
@@ -205,6 +210,11 @@ def load_config(config_path: str) -> AppConfig:
             wait_for_verification_seconds=int(security.get("wait_for_verification_seconds", 300)),
             deny_if_timeout=bool(security.get("deny_if_timeout", True)),
             verification_notify_delay_seconds=float(security.get("verification_notify_delay_seconds", 2.0)),
+            max_pending_verification_connections=int(security.get("max_pending_verification_connections", 5)),
+            max_pending_verifications_per_ip=int(security.get("max_pending_verifications_per_ip", 1)),
+            approved_ip_reuse_seconds=int(security.get("approved_ip_reuse_seconds", 60)),
+            per_ip_connection_rate_window_seconds=int(security.get("per_ip_connection_rate_window_seconds", 5)),
+            per_ip_connection_rate_limit=int(security.get("per_ip_connection_rate_limit", 4)),
         ),
         notifications=NotificationsConfig(
             telegram=TelegramConfig(

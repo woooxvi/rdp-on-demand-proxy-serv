@@ -12,6 +12,11 @@ security:
   wait_for_verification_seconds: 300
   deny_if_timeout: true
   verification_notify_delay_seconds: 2.0
+  max_pending_verification_connections: 5
+  max_pending_verifications_per_ip: 1
+  approved_ip_reuse_seconds: 60
+  per_ip_connection_rate_window_seconds: 5
+  per_ip_connection_rate_limit: 4
 
 notifications:
   telegram:

@@ -29,6 +29,11 @@ class TargetProxy:
         verification_wait_seconds: int,
         deny_if_timeout: bool,
         max_pending_connections: int,
+        max_pending_verification_connections: int,
+        max_pending_verifications_per_ip: int,
+        approved_ip_reuse_seconds: int,
+        per_ip_connection_rate_window_seconds: int,
+        per_ip_connection_rate_limit: int,
     ):
         self._bind_host = bind_host
         self._target = target
@@ -67,9 +72,14 @@ class TargetProxy:
         self._connection_log_path = Path("logs") / f"connections-{self._target.name}.log"
         self._connection_log_path.parent.mkdir(parents=True, exist_ok=True)
         self._pending_verifications: dict[str, dict[str, object]] = {}
-        self._max_pending_verification_connections = 5
-        self._max_pending_verifications_per_ip = 1
+        self._max_pending_verification_connections = max(1, int(max_pending_verification_connections))
+        self._max_pending_verifications_per_ip = max(1, int(max_pending_verifications_per_ip))
         self._forwarding_slot_wait_seconds = 20
+        self._approved_ip_reuse_seconds = max(0, int(approved_ip_reuse_seconds))
+        self._per_ip_connection_rate_window_seconds = max(0, int(per_ip_connection_rate_window_seconds))
+        self._per_ip_connection_rate_limit = max(0, int(per_ip_connection_rate_limit))
+        self._recent_approved_ips: dict[str, float] = {}
+        self._ip_rate_windows: dict[str, tuple[float, int]] = {}
 
     def set_verification_notify_delay(self, delay_seconds: float) -> None:
         self._verification_notify_delay_seconds = max(0.0, float(delay_seconds))
@@ -185,6 +195,85 @@ class TargetProxy:
         with self._state_lock:
             self._pending_verifications.pop(connection_id, None)
 
+    def _is_recently_approved_ip(self, client_ip: str) -> bool:
+        if self._approved_ip_reuse_seconds <= 0:
+            return False
+        now = time.time()
+        with self._state_lock:
+            approved_at = self._recent_approved_ips.get(client_ip)
+            if approved_at is None:
+                return False
+            if now - approved_at <= self._approved_ip_reuse_seconds:
+                return True
+            self._recent_approved_ips.pop(client_ip, None)
+        return False
+
+    def _mark_ip_approved(self, client_ip: str) -> None:
+        if self._approved_ip_reuse_seconds <= 0:
+            return
+        now = time.time()
+        with self._state_lock:
+            self._recent_approved_ips[client_ip] = now
+            # Opportunistically clean stale entries to avoid unbounded growth.
+            expiry_before = now - self._approved_ip_reuse_seconds
+            stale_ips = [ip for ip, ts in self._recent_approved_ips.items() if ts < expiry_before]
+            for ip in stale_ips:
+                self._recent_approved_ips.pop(ip, None)
+
+    def _consume_ip_connection_slot(self, client_ip: str) -> tuple[bool, float]:
+        if self._per_ip_connection_rate_window_seconds <= 0 or self._per_ip_connection_rate_limit <= 0:
+            return True, 0.0
+
+        now = time.time()
+        with self._state_lock:
+            window_start, count = self._ip_rate_windows.get(client_ip, (now, 0))
+            elapsed = now - window_start
+            if elapsed >= self._per_ip_connection_rate_window_seconds:
+                window_start = now
+                count = 0
+
+            if count < self._per_ip_connection_rate_limit:
+                self._ip_rate_windows[client_ip] = (window_start, count + 1)
+                return True, 0.0
+
+            wait_seconds = max(0.0, self._per_ip_connection_rate_window_seconds - elapsed)
+            return False, wait_seconds
+
+    def _wait_for_ip_connection_slot(
+        self,
+        client: socket.socket,
+        client_ip: str,
+        connection_id: str,
+        client_port: int,
+    ) -> tuple[bool, str]:
+        while True:
+            allowed, wait_seconds = self._consume_ip_connection_slot(client_ip)
+            if allowed:
+                return True, "acquired"
+
+            self._append_connection_audit(
+                "rate_limit_wait",
+                connection_id=connection_id,
+                client_port=client_port,
+                target=self._target.name,
+                window_seconds=self._per_ip_connection_rate_window_seconds,
+                limit=self._per_ip_connection_rate_limit,
+                wait_seconds=round(wait_seconds, 2),
+            )
+
+            deadline = time.time() + wait_seconds
+            while time.time() < deadline:
+                timeout = min(0.2, max(0.0, deadline - time.time()))
+                readable, _, _ = select.select([client], [], [], timeout)
+                if not readable:
+                    continue
+                try:
+                    peek = client.recv(1, socket.MSG_PEEK)
+                except OSError:
+                    return False, "client_disconnected_while_rate_limited"
+                if not peek:
+                    return False, "client_disconnected_while_rate_limited"
+
     def _handle_connection(self, client: socket.socket, client_ip: str, client_port: int) -> None:
         start_ts = time.time()
         connection_id = uuid4().hex[:12]
@@ -219,6 +308,24 @@ class TargetProxy:
 
         upstream: socket.socket | None = None
         try:
+            stage = "ip_rate_limit"
+            rate_ok, rate_reason = self._wait_for_ip_connection_slot(
+                client=client,
+                client_ip=client_ip,
+                connection_id=connection_id,
+                client_port=client_port,
+            )
+            if not rate_ok:
+                self._append_connection_audit(
+                    "connection_aborted",
+                    connection_id=connection_id,
+                    client_port=client_port,
+                    target=self._target.name,
+                    stage=stage,
+                    reason=rate_reason,
+                )
+                return
+
             stage = "probe_rdp_hello"
             if not self._looks_like_rdp_client_hello(client):
                 log_with_data(
@@ -234,7 +341,6 @@ class TargetProxy:
                 self._append_connection_audit(
                     "connection_aborted",
                     connection_id=connection_id,
-                    client_ip=client_ip,
                     client_port=client_port,
                     target=self._target.name,
                     stage=stage,
@@ -243,160 +349,162 @@ class TargetProxy:
                 return
 
             if self._security_enabled:
-                stage = "notify_delay_window"
-                if not self._wait_for_verification_notify_window(client):
+                if self._is_recently_approved_ip(client_ip):
+                    approved = True
                     self._append_connection_audit(
-                        "verification_notify_suppressed",
+                        "verification_bypassed_recent_approval",
                         connection_id=connection_id,
-                        client_ip=client_ip,
                         client_port=client_port,
                         target=self._target.name,
-                        reason="client_disconnected_before_notify_window",
-                        delay_seconds=round(self._verification_notify_delay_seconds, 2),
+                        reuse_seconds=self._approved_ip_reuse_seconds,
                     )
-                    self._append_connection_audit(
-                        "connection_aborted",
-                        connection_id=connection_id,
-                        client_ip=client_ip,
-                        client_port=client_port,
-                        target=self._target.name,
-                        stage=stage,
-                        reason="client_disconnected_before_notify_window",
-                    )
-                    return
-
-                stage = "create_verification"
-                can_wait, queue_reason, replaced = self._register_pending_verification(
-                    connection_id=connection_id,
-                    client=client,
-                    client_ip=client_ip,
-                    client_port=client_port,
-                )
-                if not can_wait:
-                    self._append_connection_audit(
-                        "connection_rejected",
-                        connection_id=connection_id,
-                        client_ip=client_ip,
-                        client_port=client_port,
-                        target=self._target.name,
-                        reason=queue_reason,
-                    )
-                    return
-                if replaced:
-                    self._append_connection_audit(
-                        "pending_replaced_same_ip",
-                        connection_id=connection_id,
-                        client_ip=client_ip,
-                        client_port=client_port,
-                        target=self._target.name,
-                        replaced_connection_id=str(replaced.get("connection_id", "")),
-                        replaced_client_port=int(replaced.get("client_port", 0)),
-                    )
-                pending_registered = True
-                token, evt, url = self._verification.create_token(
-                    {
-                        "target": self._target.name,
-                        "client_ip": client_ip,
-                        "instance_id": self._target.cloud.instance_id if self._target.cloud else "N/A",
-                    }
-                )
-                self._notifier.send_verification(client_ip, self._target, url, token=token)
-                log_with_data(
-                    self._logger,
-                    logging.INFO,
-                    "Verification sent",
-                    connection_id=connection_id,
-                    client_ip=client_ip,
-                    token=token,
-                    verify_url=url,
-                )
-                self._append_connection_audit(
-                    "verification_sent",
-                    connection_id=connection_id,
-                    client_ip=client_ip,
-                    client_port=client_port,
-                    target=self._target.name,
-                    token=token,
-                    delay_seconds=round(self._verification_notify_delay_seconds, 2),
-                )
-
-                stage = "wait_verification"
-                wait_start_ts = time.time()
-                self._append_connection_audit(
-                    "verification_wait_started",
-                    connection_id=connection_id,
-                    client_ip=client_ip,
-                    client_port=client_port,
-                    target=self._target.name,
-                    wait_seconds=self._verification_wait_seconds,
-                )
-                approved, wait_reason = self._wait_for_verification_or_disconnect(
-                    client=client,
-                    event=evt,
-                    timeout_seconds=self._verification_wait_seconds,
-                )
-                self._append_connection_audit(
-                    "verification_wait_finished",
-                    connection_id=connection_id,
-                    client_ip=client_ip,
-                    client_port=client_port,
-                    target=self._target.name,
-                    approved=approved,
-                    reason=wait_reason,
-                    waited_seconds=round(time.time() - wait_start_ts, 2),
-                )
-                if not approved and wait_reason == "client_disconnected":
-                    self._verification.cancel_token(token)
-                    self._append_connection_audit(
-                        "verification_cancelled",
-                        connection_id=connection_id,
-                        client_ip=client_ip,
-                        client_port=client_port,
-                        target=self._target.name,
-                        reason=wait_reason,
-                    )
-                    self._append_connection_audit(
-                        "connection_aborted",
-                        connection_id=connection_id,
-                        client_ip=client_ip,
-                        client_port=client_port,
-                        target=self._target.name,
-                        stage=stage,
-                        reason=wait_reason,
-                    )
-                    return
-                if not approved:
-                    log_with_data(
-                        self._logger,
-                        logging.WARNING,
-                        "Verification timeout",
-                        connection_id=connection_id,
-                        client_ip=client_ip,
-                        target=self._target.name,
-                    )
-                    self._append_connection_audit(
-                        "verification_timeout",
-                        connection_id=connection_id,
-                        client_ip=client_ip,
-                        client_port=client_port,
-                        target=self._target.name,
-                        wait_seconds=self._verification_wait_seconds,
-                        reason=wait_reason,
-                    )
-                    if self._deny_if_timeout:
+                else:
+                    stage = "notify_delay_window"
+                    if not self._wait_for_verification_notify_window(client):
+                        self._append_connection_audit(
+                            "verification_notify_suppressed",
+                            connection_id=connection_id,
+                            client_port=client_port,
+                            target=self._target.name,
+                            reason="client_disconnected_before_notify_window",
+                            delay_seconds=round(self._verification_notify_delay_seconds, 2),
+                        )
                         self._append_connection_audit(
                             "connection_aborted",
                             connection_id=connection_id,
-                            client_ip=client_ip,
                             client_port=client_port,
                             target=self._target.name,
                             stage=stage,
-                            reason="verification_timeout_deny",
+                            reason="client_disconnected_before_notify_window",
                         )
                         return
 
-                self._unregister_pending_verification(connection_id)
-                pending_registered = False
+                    stage = "create_verification"
+                    can_wait, queue_reason, replaced = self._register_pending_verification(
+                        connection_id=connection_id,
+                        client=client,
+                        client_ip=client_ip,
+                        client_port=client_port,
+                    )
+                    if not can_wait:
+                        self._append_connection_audit(
+                            "connection_rejected",
+                            connection_id=connection_id,
+                            client_port=client_port,
+                            target=self._target.name,
+                            reason=queue_reason,
+                        )
+                        return
+                    if replaced:
+                        self._append_connection_audit(
+                            "pending_replaced_same_ip",
+                            connection_id=connection_id,
+                            client_port=client_port,
+                            target=self._target.name,
+                            replaced_connection_id=str(replaced.get("connection_id", "")),
+                            replaced_client_port=int(replaced.get("client_port", 0)),
+                        )
+                    pending_registered = True
+                    token, evt, url = self._verification.create_token(
+                        {
+                            "target": self._target.name,
+                            "client_ip": client_ip,
+                            "instance_id": self._target.cloud.instance_id if self._target.cloud else "N/A",
+                        }
+                    )
+                    self._notifier.send_verification(client_ip, self._target, url, token=token)
+                    log_with_data(
+                        self._logger,
+                        logging.INFO,
+                        "Verification sent",
+                        connection_id=connection_id,
+                        client_ip=client_ip,
+                        token=token,
+                        verify_url=url,
+                    )
+                    self._append_connection_audit(
+                        "verification_sent",
+                        connection_id=connection_id,
+                        client_port=client_port,
+                        target=self._target.name,
+                        token=token,
+                        delay_seconds=round(self._verification_notify_delay_seconds, 2),
+                    )
+
+                    stage = "wait_verification"
+                    wait_start_ts = time.time()
+                    self._append_connection_audit(
+                        "verification_wait_started",
+                        connection_id=connection_id,
+                        client_port=client_port,
+                        target=self._target.name,
+                        wait_seconds=self._verification_wait_seconds,
+                    )
+                    approved, wait_reason = self._wait_for_verification_or_disconnect(
+                        client=client,
+                        event=evt,
+                        timeout_seconds=self._verification_wait_seconds,
+                    )
+                    self._append_connection_audit(
+                        "verification_wait_finished",
+                        connection_id=connection_id,
+                        client_port=client_port,
+                        target=self._target.name,
+                        approved=approved,
+                        reason=wait_reason,
+                        waited_seconds=round(time.time() - wait_start_ts, 2),
+                    )
+                    if not approved and wait_reason == "client_disconnected":
+                        self._verification.cancel_token(token)
+                        self._append_connection_audit(
+                            "verification_cancelled",
+                            connection_id=connection_id,
+                            client_port=client_port,
+                            target=self._target.name,
+                            reason=wait_reason,
+                        )
+                        self._append_connection_audit(
+                            "connection_aborted",
+                            connection_id=connection_id,
+                            client_port=client_port,
+                            target=self._target.name,
+                            stage=stage,
+                            reason=wait_reason,
+                        )
+                        return
+                    if not approved:
+                        log_with_data(
+                            self._logger,
+                            logging.WARNING,
+                            "Verification timeout",
+                            connection_id=connection_id,
+                            client_ip=client_ip,
+                            target=self._target.name,
+                        )
+                        self._append_connection_audit(
+                            "verification_timeout",
+                            connection_id=connection_id,
+                            client_port=client_port,
+                            target=self._target.name,
+                            wait_seconds=self._verification_wait_seconds,
+                            reason=wait_reason,
+                        )
+                        if self._deny_if_timeout:
+                            self._append_connection_audit(
+                                "connection_aborted",
+                                connection_id=connection_id,
+                                client_port=client_port,
+                                target=self._target.name,
+                                stage=stage,
+                                reason="verification_timeout_deny",
+                            )
+                            return
+
+                    self._unregister_pending_verification(connection_id)
+                    pending_registered = False
+
+                if approved:
+                    self._mark_ip_approved(client_ip)
 
             stage = "wait_forwarding_slot"
             lock_ok, lock_reason = self._acquire_forwarding_slot_or_disconnect(
@@ -407,7 +515,6 @@ class TargetProxy:
                 self._append_connection_audit(
                     "connection_aborted",
                     connection_id=connection_id,
-                    client_ip=client_ip,
                     client_port=client_port,
                     target=self._target.name,
                     stage=stage,
@@ -421,14 +528,12 @@ class TargetProxy:
                 self._append_connection_audit(
                     "instance_not_ready",
                     connection_id=connection_id,
-                    client_ip=client_ip,
                     client_port=client_port,
                     target=self._target.name,
                 )
                 self._append_connection_audit(
                     "connection_aborted",
                     connection_id=connection_id,
-                    client_ip=client_ip,
                     client_port=client_port,
                     target=self._target.name,
                     stage=stage,
@@ -458,7 +563,6 @@ class TargetProxy:
             self._append_connection_audit(
                 "forwarding_started",
                 connection_id=connection_id,
-                client_ip=client_ip,
                 client_port=client_port,
                 target=self._target.name,
                 latency_seconds=round(time.time() - start_ts, 2),
@@ -480,7 +584,6 @@ class TargetProxy:
             self._append_connection_audit(
                 "forwarding_ended",
                 connection_id=connection_id,
-                client_ip=client_ip,
                 client_port=client_port,
                 target=self._target.name,
                 client_to_upstream_bytes=c2u_bytes,
@@ -505,7 +608,6 @@ class TargetProxy:
                 "connection_reset",
                 connection_id=connection_id,
                 stage=stage,
-                client_ip=client_ip,
                 client_port=client_port,
                 target=self._target.name,
                 errno=getattr(exc, "errno", None),
@@ -527,7 +629,6 @@ class TargetProxy:
                 "connection_failed",
                 connection_id=connection_id,
                 stage=stage,
-                client_ip=client_ip,
                 client_port=client_port,
                 target=self._target.name,
                 error=str(exc),
@@ -573,7 +674,6 @@ class TargetProxy:
                 "connection_closed",
                 connection_id=connection_id,
                 stage=stage,
-                client_ip=client_ip,
                 client_port=client_port,
                 target=self._target.name,
                 duration_seconds=round(duration_seconds, 2),
@@ -672,7 +772,9 @@ class TargetProxy:
 
     def _append_connection_audit(self, event: str, **fields: object) -> None:
         now = datetime.now().isoformat(sep=" ", timespec="seconds")
-        payload = sanitize_sensitive_log_fields(dict(fields))
+        payload = dict(fields)
+        payload.pop("client_ip", None)
+        payload = sanitize_sensitive_log_fields(payload)
         pairs = [f"{k}={payload[k]}" for k in sorted(payload.keys())]
         line = f"{now} event={event}"
         if pairs:
@@ -1162,6 +1264,11 @@ class RDPProxyApp:
                 verification_wait_seconds=cfg.security.wait_for_verification_seconds,
                 deny_if_timeout=cfg.security.deny_if_timeout,
                 max_pending_connections=cfg.server.max_pending_connections,
+                max_pending_verification_connections=cfg.security.max_pending_verification_connections,
+                max_pending_verifications_per_ip=cfg.security.max_pending_verifications_per_ip,
+                approved_ip_reuse_seconds=cfg.security.approved_ip_reuse_seconds,
+                per_ip_connection_rate_window_seconds=cfg.security.per_ip_connection_rate_window_seconds,
+                per_ip_connection_rate_limit=cfg.security.per_ip_connection_rate_limit,
             )
             for t in cfg.targets
         ]
