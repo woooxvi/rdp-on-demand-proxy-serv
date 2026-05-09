@@ -22,6 +22,7 @@ class SecurityConfig:
     token_ttl_seconds: int
     wait_for_verification_seconds: int
     deny_if_timeout: bool
+    forwarding_slot_wait_seconds: int = 120
     verification_notify_delay_seconds: float = 2.0
     max_pending_verification_connections: int = 5
     max_pending_verifications_per_ip: int = 1
@@ -209,6 +210,7 @@ def load_config(config_path: str) -> AppConfig:
             token_ttl_seconds=int(security.get("token_ttl_seconds", 300)),
             wait_for_verification_seconds=int(security.get("wait_for_verification_seconds", 300)),
             deny_if_timeout=bool(security.get("deny_if_timeout", True)),
+            forwarding_slot_wait_seconds=int(security.get("forwarding_slot_wait_seconds", 120)),
             verification_notify_delay_seconds=float(security.get("verification_notify_delay_seconds", 2.0)),
             max_pending_verification_connections=int(security.get("max_pending_verification_connections", 5)),
             max_pending_verifications_per_ip=int(security.get("max_pending_verifications_per_ip", 1)),

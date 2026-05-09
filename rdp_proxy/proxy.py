@@ -28,6 +28,7 @@ class TargetProxy:
         security_enabled: bool,
         verification_wait_seconds: int,
         deny_if_timeout: bool,
+        forwarding_slot_wait_seconds: int,
         max_pending_connections: int,
         max_pending_verification_connections: int,
         max_pending_verifications_per_ip: int,
@@ -74,7 +75,7 @@ class TargetProxy:
         self._pending_verifications: dict[str, dict[str, object]] = {}
         self._max_pending_verification_connections = max(1, int(max_pending_verification_connections))
         self._max_pending_verifications_per_ip = max(1, int(max_pending_verifications_per_ip))
-        self._forwarding_slot_wait_seconds = 20
+        self._forwarding_slot_wait_seconds = max(0, int(forwarding_slot_wait_seconds))
         self._approved_ip_reuse_seconds = max(0, int(approved_ip_reuse_seconds))
         self._per_ip_connection_rate_window_seconds = max(0, int(per_ip_connection_rate_window_seconds))
         self._per_ip_connection_rate_limit = max(0, int(per_ip_connection_rate_limit))
@@ -264,7 +265,10 @@ class TargetProxy:
             deadline = time.time() + wait_seconds
             while time.time() < deadline:
                 timeout = min(0.2, max(0.0, deadline - time.time()))
-                readable, _, _ = select.select([client], [], [], timeout)
+                try:
+                    readable, _, _ = select.select([client], [], [], timeout)
+                except (OSError, ValueError):
+                    return False, "client_disconnected_while_rate_limited"
                 if not readable:
                     continue
                 try:
@@ -351,6 +355,15 @@ class TargetProxy:
             if self._security_enabled:
                 if self._is_recently_approved_ip(client_ip):
                     approved = True
+                    log_with_data(
+                        self._logger,
+                        logging.INFO,
+                        "Verification bypassed by recent IP approval",
+                        connection_id=connection_id,
+                        client_ip=client_ip,
+                        target=self._target.name,
+                        reuse_seconds=self._approved_ip_reuse_seconds,
+                    )
                     self._append_connection_audit(
                         "verification_bypassed_recent_approval",
                         connection_id=connection_id,
@@ -512,6 +525,16 @@ class TargetProxy:
                 timeout_seconds=self._forwarding_slot_wait_seconds,
             )
             if not lock_ok:
+                log_with_data(
+                    self._logger,
+                    logging.WARNING,
+                    "Forwarding slot not acquired",
+                    connection_id=connection_id,
+                    client_ip=client_ip,
+                    target=self._target.name,
+                    reason=lock_reason,
+                    wait_seconds=self._forwarding_slot_wait_seconds,
+                )
                 self._append_connection_audit(
                     "connection_aborted",
                     connection_id=connection_id,
@@ -711,7 +734,10 @@ class TargetProxy:
         deadline = time.time() + delay_seconds
         while time.time() < deadline:
             timeout = min(0.2, max(0.0, deadline - time.time()))
-            readable, _, _ = select.select([client], [], [], timeout)
+            try:
+                readable, _, _ = select.select([client], [], [], timeout)
+            except (OSError, ValueError):
+                return False
             if not readable:
                 continue
             try:
@@ -735,7 +761,10 @@ class TargetProxy:
             if event.wait(timeout=0.2):
                 return True, "approved"
 
-            readable, _, _ = select.select([client], [], [], 0)
+            try:
+                readable, _, _ = select.select([client], [], [], 0)
+            except (OSError, ValueError):
+                return False, "client_disconnected"
             if not readable:
                 continue
             try:
@@ -753,21 +782,60 @@ class TargetProxy:
         timeout_seconds: int,
     ) -> tuple[bool, str]:
         deadline = time.time() + max(0, timeout_seconds)
+        waiting_logged = False
 
         while time.time() < deadline:
             if self._single_session_lock.acquire(blocking=False):
                 return True, "acquired"
 
-            readable, _, _ = select.select([client], [], [], 0.2)
+            if not waiting_logged:
+                log_with_data(
+                    self._logger,
+                    logging.INFO,
+                    "Forwarding slot busy, waiting",
+                    target=self._target.name,
+                    wait_seconds=timeout_seconds,
+                )
+                waiting_logged = True
+
+            try:
+                readable, _, _ = select.select([client], [], [], 0.2)
+            except (OSError, ValueError):
+                log_with_data(
+                    self._logger,
+                    logging.INFO,
+                    "Client disconnected while waiting forwarding slot",
+                    target=self._target.name,
+                )
+                return False, "client_disconnected_while_waiting_forwarding_slot"
             if not readable:
                 continue
             try:
                 peek = client.recv(1, socket.MSG_PEEK)
             except OSError:
+                log_with_data(
+                    self._logger,
+                    logging.INFO,
+                    "Client disconnected while waiting forwarding slot",
+                    target=self._target.name,
+                )
                 return False, "client_disconnected_while_waiting_forwarding_slot"
             if not peek:
+                log_with_data(
+                    self._logger,
+                    logging.INFO,
+                    "Client disconnected while waiting forwarding slot",
+                    target=self._target.name,
+                )
                 return False, "client_disconnected_while_waiting_forwarding_slot"
 
+        log_with_data(
+            self._logger,
+            logging.WARNING,
+            "Forwarding slot wait timeout",
+            target=self._target.name,
+            wait_seconds=timeout_seconds,
+        )
         return False, "forwarding_slot_busy_timeout"
 
     def _append_connection_audit(self, event: str, **fields: object) -> None:
@@ -1263,6 +1331,7 @@ class RDPProxyApp:
                 security_enabled=cfg.security.enabled,
                 verification_wait_seconds=cfg.security.wait_for_verification_seconds,
                 deny_if_timeout=cfg.security.deny_if_timeout,
+                forwarding_slot_wait_seconds=cfg.security.forwarding_slot_wait_seconds,
                 max_pending_connections=cfg.server.max_pending_connections,
                 max_pending_verification_connections=cfg.security.max_pending_verification_connections,
                 max_pending_verifications_per_ip=cfg.security.max_pending_verifications_per_ip,

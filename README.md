@@ -125,6 +125,7 @@ sudo systemctl status rdp-proxy
 - `targets[].cloud.stop_mode`: 腾讯云停机模式，建议 `STOP_CHARGING`
 - `targets[].cloud.provider`: `tencent_cvm` 或 `aliyun_ecs`
 - `security.wait_for_verification_seconds`: 等待验证时间
+- `security.forwarding_slot_wait_seconds`: 验证通过后等待转发槽位时间（默认 120）。当目标已有会话占用时，新连接会在该时间内排队等待放通。
 - `security.verification_notify_delay_seconds`: 验证通知延迟窗口（默认 2 秒）。连接在该窗口内断开时，不发送连接请求通知，可抑制扫描噪声。
 - `security.max_pending_verification_connections`: 待授权连接池总上限（默认 5）。
 - `security.max_pending_verifications_per_ip`: 同源 IP 待授权并发上限（默认 1）。
