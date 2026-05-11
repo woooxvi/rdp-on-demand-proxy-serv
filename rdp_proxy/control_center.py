@@ -81,6 +81,8 @@ class ControlCenterService:
         self._requests_by_key: dict[tuple[str, str], ControlRequestAggregate] = {}
         self._request_history: list[ControlRequestEvent] = []
         self._action_tokens: dict[str, ActionToken] = {}
+        self._whitelist_set: set[tuple[str, str]] = set()  # (target, client_ip)
+        self._blacklist_set: set[tuple[str, str]] = set()  # (target, client_ip)
         self._total_requested_count = 0
         self._total_approved_count = 0
         self._lock = threading.Lock()
@@ -97,6 +99,58 @@ class ControlCenterService:
     def recent_url(self, window_seconds: int) -> str:
         window_seconds = max(1, int(window_seconds))
         return f"{self._external_base_url}/control?token={self._control_token}&view=recent&window={window_seconds}"
+
+    def is_blacklisted(self, target: str, client_ip: str) -> bool:
+        """检查是否在黑名单中"""
+        with self._lock:
+            return (target, client_ip) in self._blacklist_set
+
+    def is_whitelisted(self, target: str, client_ip: str) -> bool:
+        """检查是否在白名单中（已放行过）"""
+        with self._lock:
+            return (target, client_ip) in self._whitelist_set
+
+    def get_request_status(self, request_id: str) -> str | None:
+        """获取请求的当前状态，用于检查黑名单/白名单状态"""
+        with self._lock:
+            event = self._requests_by_id.get(request_id)
+            if event is None:
+                return None
+            return event.status
+
+    def is_request_rejected(self, request_id: str) -> bool:
+        """检查请求是否已被拒绝（黑名单）"""
+        with self._lock:
+            event = self._requests_by_id.get(request_id)
+            if event is None:
+                return False
+            return event.status == "rejected"
+
+    def blacklist_targets(self, targets: list[tuple[str, str]]) -> None:
+        """批量加入黑名单，targets 为 [(target, client_ip), ...]"""
+        with self._lock:
+            for target, client_ip in targets:
+                if target and client_ip:
+                    self._blacklist_set.add((target, client_ip))
+                    # 从白名单中移除
+                    self._whitelist_set.discard((target, client_ip))
+                    log_with_data(
+                        self._logger,
+                        logging.INFO,
+                        "Target added to blacklist",
+                        target=target,
+                        client_ip=client_ip,
+                    )
+
+    def get_whitelist_snapshot(self) -> list[dict[str, str]]:
+        """获取当前白名单快照"""
+        with self._lock:
+            return [{"target": target, "client_ip": client_ip} for target, client_ip in sorted(self._whitelist_set)]
+
+    def get_blacklist_snapshot(self) -> list[dict[str, str]]:
+        """获取当前黑名单快照"""
+        with self._lock:
+            return [{"target": target, "client_ip": client_ip} for target, client_ip in sorted(self._blacklist_set)]
 
     def create_action_links(self, target: str) -> tuple[str, str]:
         now = time.time()
@@ -162,6 +216,50 @@ class ControlCenterService:
         with self._lock:
             self._cleanup_locked(now)
             key = (target, client_ip)
+
+            # 检查是否在黑名单中，如果在直接拒绝
+            if key in self._blacklist_set:
+                event.status = "rejected"
+                event.closed_at = now
+                event.close_reason = "blacklisted"
+                event.wait_event.set()
+                self._requests_by_id[connection_id] = event
+                self._request_history.append(event)
+                log_with_data(
+                    self._logger,
+                    logging.INFO,
+                    "Request rejected - target in blacklist",
+                    target=target,
+                    client_ip=client_ip,
+                )
+                return event.wait_event
+
+            # 检查是否在白名单中，如果在直接放行
+            if key in self._whitelist_set:
+                event.status = "approved"
+                event.approved_at = now
+                event.wait_event.set()
+                aggregate = self._requests_by_key.get(key)
+                if aggregate is None:
+                    aggregate = ControlRequestAggregate(target=target, client_ip=client_ip, geo_text=geo_text)
+                    self._requests_by_key[key] = aggregate
+                aggregate.status = "approved"
+                aggregate.approved_count += 1
+                aggregate.active_approved_at = now
+                self._requests_by_id[connection_id] = event
+                self._request_history.append(event)
+                self._total_approved_count += 1
+                if self._on_approved:
+                    self._on_approved(connection_id, self._event_meta(event))
+                log_with_data(
+                    self._logger,
+                    logging.INFO,
+                    "Request auto-approved - target in whitelist",
+                    target=target,
+                    client_ip=client_ip,
+                )
+                return event.wait_event
+
             aggregate = self._requests_by_key.get(key)
             if aggregate is None:
                 aggregate = ControlRequestAggregate(target=target, client_ip=client_ip, geo_text=geo_text)
@@ -213,6 +311,8 @@ class ControlCenterService:
                 aggregate.last_state_change_at = now
                 aggregate.last_close_reason = ""
             self._total_approved_count += 1
+            # 添加到白名单
+            self._whitelist_set.add((event.target, event.client_ip))
 
         event.wait_event.set()
         log_with_data(
@@ -267,6 +367,17 @@ class ControlCenterService:
 
             pending_records = [item for item in aggregates if item.status == "pending" and item.active_request_id]
             approved_records = [item for item in aggregates if item.status == "approved" and item.active_request_id]
+            
+            # 区分pending中哪些是历史已放行过的
+            previously_approved_records = [
+                item for item in pending_records
+                if (item.target, item.client_ip) in self._whitelist_set
+            ]
+            other_pending_records = [
+                item for item in pending_records
+                if (item.target, item.client_ip) not in self._whitelist_set
+            ]
+            
             if view == "recent":
                 records = recent_events
             else:
@@ -294,6 +405,8 @@ class ControlCenterService:
             "records": [self._aggregate_to_dict(item) for item in records] if view != "recent" else [self._event_to_dict(item) for item in records],
             "pending_records": [self._aggregate_to_dict(item) for item in pending_records],
             "approved_records": [self._aggregate_to_dict(item) for item in approved_records],
+            "previously_approved_records": [self._aggregate_to_dict(item) for item in previously_approved_records],
+            "other_pending_records": [self._aggregate_to_dict(item) for item in other_pending_records],
             "recent_records": [self._event_to_dict(item) for item in recent_events],
         }
 
@@ -378,6 +491,9 @@ class ControlCenterService:
                 if parsed.path == "/approve":
                     self._handle_approve()
                     return
+                if parsed.path == "/blacklist":
+                    self._handle_blacklist()
+                    return
                 self._send_html(HTTPStatus.NOT_FOUND, "Not Found")
 
             def _handle_control(self, parsed) -> None:
@@ -412,6 +528,29 @@ class ControlCenterService:
                     self._send_html(HTTPStatus.CONFLICT, self._close_page_html("记录已失效或已处理"))
                     return
                 self._send_html(HTTPStatus.OK, self._close_page_html("请求已放行"))
+
+            def _handle_blacklist(self) -> None:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                body = self.rfile.read(length).decode("utf-8") if length > 0 else ""
+                form = parse_qs(body)
+                token = form.get("token", [""])[0]
+                if token != service._control_token:
+                    self._send_html(HTTPStatus.FORBIDDEN, "无效的控制地址")
+                    return
+                targets_raw = form.get("targets", [""])[0]
+                if not targets_raw:
+                    self._send_html(HTTPStatus.BAD_REQUEST, "缺少黑名单目标")
+                    return
+                try:
+                    import json
+                    targets = json.loads(targets_raw)
+                    if not isinstance(targets, list):
+                        targets = []
+                    service.blacklist_targets([(t.get("target", ""), t.get("client_ip", "")) for t in targets if isinstance(t, dict)])
+                    self._send_html(HTTPStatus.OK, self._close_page_html(f"已添加 {len(targets)} 个目标到黑名单"))
+                except Exception as e:
+                    self._send_html(HTTPStatus.BAD_REQUEST, self._close_page_html(f"黑名单操作失败: {str(e)}"))
+
 
             def _handle_action(self, parsed) -> None:
                 token = parse_qs(parsed.query).get("token", [""])[0]
@@ -490,7 +629,9 @@ class ControlCenterService:
                     body_parts.append(self._render_recent_table(recent_records))
                 else:
                     body_parts.append("<div class='toolbar'><span class='pill'>当前控制链接：<a href='" + control_url + "'>打开</a></span><span class='pill'>最近记录：<a href='" + recent_url + "'>查看最近 1h</a></span></div>")
-                    body_parts.append(self._render_record_table(pending_records, approved_records))
+                    previously_approved = list(snapshot.get("previously_approved_records", []))
+                    other_pending = list(snapshot.get("other_pending_records", []))
+                    body_parts.append(self._render_record_table(previously_approved, other_pending, approved_records))
                     body_parts.append("<div class='section'><h2>最近 1h 请求记录</h2>")
                     body_parts.append(self._render_recent_table(recent_records))
                     body_parts.append("</div>")
@@ -499,18 +640,30 @@ class ControlCenterService:
                 body_parts.append("</div></body></html>")
                 return "".join(body_parts)
 
-            def _render_record_table(self, pending_records: list[dict], approved_records: list[dict]) -> str:
+            def _render_record_table(self, previously_approved_records: list[dict], other_pending_records: list[dict], approved_records: list[dict]) -> str:
                 rows: list[str] = []
-                if pending_records:
-                    rows.append("<h3 style='margin:12px 0 8px;'>挂起待授权</h3>")
-                    rows.append(self._table_from_aggregates(pending_records, allow_action=True))
+                
+                if previously_approved_records:
+                    rows.append("<h3 style='margin:12px 0 8px;'>历史曾经放行</h3>")
+                    rows.append(self._table_from_aggregates(previously_approved_records, allow_action=True, allow_blacklist=False))
                 else:
-                    rows.append("<div class='empty'>暂无挂起待授权请求</div>")
+                    rows.append("<h3 style='margin:12px 0 8px;'>历史曾经放行</h3>")
+                    rows.append("<div class='empty'>暂无历史放行记录</div>")
+                
+                if other_pending_records:
+                    rows.append("<h3 style='margin:20px 0 8px;'>其他待授权 <span style='font-size:12px;color:var(--muted);'>(可批量加入黑名单)</span></h3>")
+                    rows.append(self._table_from_aggregates(other_pending_records, allow_action=True, allow_blacklist=True))
+                else:
+                    rows.append("<h3 style='margin:20px 0 8px;'>其他待授权</h3>")
+                    rows.append("<div class='empty'>暂无其他待授权请求</div>")
+                
                 if approved_records:
                     rows.append("<h3 style='margin:20px 0 8px;'>当前已放行</h3>")
-                    rows.append(self._table_from_aggregates(approved_records, allow_action=False))
+                    rows.append(self._table_from_aggregates(approved_records, allow_action=False, allow_blacklist=False))
                 else:
+                    rows.append("<h3 style='margin:20px 0 8px;'>当前已放行</h3>")
                     rows.append("<div class='empty' style='margin-top:16px;'>暂无当前已放行请求</div>")
+                
                 return "".join(rows)
 
             def _render_recent_table(self, recent_records: list[dict]) -> str:
@@ -531,27 +684,83 @@ class ControlCenterService:
                     )
                 return header + "".join(rows) + "</tbody></table>"
 
-            def _table_from_aggregates(self, records: list[dict], allow_action: bool) -> str:
+            def _table_from_aggregates(self, records: list[dict], allow_action: bool, allow_blacklist: bool = False) -> str:
                 if not records:
                     return "<div class='empty'>暂无记录</div>"
-                header = "<table><thead><tr><th>目标</th><th>IP 地址</th><th>GEO 地址</th><th>最近一次发起</th><th>上一次发起</th><th>发起次数</th><th>放行次数</th><th>状态</th><th>操作</th></tr></thead><tbody>"
+                
+                if allow_blacklist:
+                    header = "<div style='margin-bottom:12px;'><form id='blacklist-form' method='post' action='/blacklist' style='display:inline;'><input type='hidden' name='token' value='" + html.escape(service._control_token) + "'><input type='hidden' id='targets-input' name='targets' value='[]'><button class='action-btn' type='button' onclick='submitBlacklist()' style='background:linear-gradient(135deg,#ff7b72,#ff5555);'>批量加入黑名单</button></form></div><table><thead><tr><th><input type='checkbox' id='select-all-blacklist' onclick='toggleAll()'></th><th>目标</th><th>IP 地址</th><th>GEO 地址</th><th>最近一次发起</th><th>上一次发起</th><th>发起次数</th><th>放行次数</th><th>状态</th><th>操作</th></tr></thead><tbody>"
+                else:
+                    header = "<table><thead><tr><th>目标</th><th>IP 地址</th><th>GEO 地址</th><th>最近一次发起</th><th>上一次发起</th><th>发起次数</th><th>放行次数</th><th>状态</th><th>操作</th></tr></thead><tbody>"
+                
                 rows = []
-                for record in records:
+                for idx, record in enumerate(records):
                     request_id = html.escape(str(record.get('active_request_id', '')))
-                    rows.append(
-                        "<tr>"
-                        f"<td>{html.escape(str(record.get('target', '')))}</td>"
-                        f"<td>{html.escape(str(record.get('client_ip', '')))}</td>"
-                        f"<td>{html.escape(self._display_geo(str(record.get('geo_text', ''))))}</td>"
-                        f"<td>{self._format_optional_time(record.get('last_requested_at'))}</td>"
-                        f"<td>{self._format_optional_time(record.get('previous_requested_at'))}</td>"
-                        f"<td>{int(record.get('request_count', 0))}</td>"
-                        f"<td>{int(record.get('approved_count', 0))}</td>"
-                        f"<td><span class='status {self._status_class(str(record.get('status', '')))}'>{html.escape(self._status_text(str(record.get('status', ''))))}</span></td>"
-                        f"<td>{self._render_action_button(request_id, allow_action)}</td>"
-                        "</tr>"
-                    )
-                return header + "".join(rows) + "</tbody></table>"
+                    target = html.escape(str(record.get('target', '')))
+                    client_ip = html.escape(str(record.get('client_ip', '')))
+                    
+                    if allow_blacklist:
+                        checkbox = f"<input type='checkbox' class='blacklist-check' value='{{\"{target}\",\"{client_ip}\"}}'>"
+                        rows.append(
+                            "<tr>"
+                            f"<td>{checkbox}</td>"
+                            f"<td>{target}</td>"
+                            f"<td>{client_ip}</td>"
+                            f"<td>{html.escape(self._display_geo(str(record.get('geo_text', ''))))}</td>"
+                            f"<td>{self._format_optional_time(record.get('last_requested_at'))}</td>"
+                            f"<td>{self._format_optional_time(record.get('previous_requested_at'))}</td>"
+                            f"<td>{int(record.get('request_count', 0))}</td>"
+                            f"<td>{int(record.get('approved_count', 0))}</td>"
+                            f"<td><span class='status {self._status_class(str(record.get('status', '')))}'>{html.escape(self._status_text(str(record.get('status', ''))))}</span></td>"
+                            f"<td>{self._render_action_button(request_id, allow_action)}</td>"
+                            "</tr>"
+                        )
+                    else:
+                        rows.append(
+                            "<tr>"
+                            f"<td>{target}</td>"
+                            f"<td>{client_ip}</td>"
+                            f"<td>{html.escape(self._display_geo(str(record.get('geo_text', ''))))}</td>"
+                            f"<td>{self._format_optional_time(record.get('last_requested_at'))}</td>"
+                            f"<td>{self._format_optional_time(record.get('previous_requested_at'))}</td>"
+                            f"<td>{int(record.get('request_count', 0))}</td>"
+                            f"<td>{int(record.get('approved_count', 0))}</td>"
+                            f"<td><span class='status {self._status_class(str(record.get('status', '')))}'>{html.escape(self._status_text(str(record.get('status', ''))))}</span></td>"
+                            f"<td>{self._render_action_button(request_id, allow_action)}</td>"
+                            "</tr>"
+                        )
+                
+                result = header + "".join(rows) + "</tbody></table>"
+                
+                if allow_blacklist:
+                    result += """<script>
+function toggleAll() {
+    const selectAll = document.getElementById('select-all-blacklist');
+    const checks = document.querySelectorAll('.blacklist-check');
+    checks.forEach(c => c.checked = selectAll.checked);
+}
+function submitBlacklist() {
+    const checks = document.querySelectorAll('.blacklist-check:checked');
+    const targets = [];
+    checks.forEach(c => {
+        const parts = c.value.slice(1, -1).split(',').map(x => x.trim().slice(1, -1));
+        if (parts.length === 2) {
+            targets.push({target: parts[0], client_ip: parts[1]});
+        }
+    });
+    if (!targets.length) {
+        alert('请先选择要加入黑名单的项目');
+        return;
+    }
+    if (!confirm('确认要将选中的 ' + targets.length + ' 个项目加入黑名单吗？')) {
+        return;
+    }
+    document.getElementById('targets-input').value = JSON.stringify(targets);
+    document.getElementById('blacklist-form').submit();
+}
+</script>"""
+                
+                return result
 
             def _render_action_button(self, request_id: str, allow_action: bool) -> str:
                 if not allow_action or not request_id:

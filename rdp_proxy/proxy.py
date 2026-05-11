@@ -416,7 +416,47 @@ class TargetProxy:
                     geo_text=geo_text,
                 )
 
-                if self._is_recently_approved_ip(client_ip):
+                # 检查是否被黑名单拒绝
+                if self._verification.is_request_rejected(connection_id):
+                    log_with_data(
+                        self._logger,
+                        logging.INFO,
+                        "Connection rejected - target in blacklist",
+                        connection_id=connection_id,
+                        client_ip=client_ip,
+                        target=self._target.name,
+                    )
+                    self._append_connection_audit(
+                        "connection_rejected_blacklist",
+                        connection_id=connection_id,
+                        client_port=client_port,
+                        target=self._target.name,
+                    )
+                    self._unregister_pending_verification(connection_id)
+                    self._verification.close_request(connection_id, "blacklisted")
+                    return
+
+                # 检查是否被自动白名单放行
+                req_status = self._verification.get_request_status(connection_id)
+                if req_status == "approved":
+                    approved = True
+                    log_with_data(
+                        self._logger,
+                        logging.INFO,
+                        "Connection auto-approved - target in whitelist",
+                        connection_id=connection_id,
+                        client_ip=client_ip,
+                        target=self._target.name,
+                    )
+                    self._append_connection_audit(
+                        "verification_auto_approved_whitelist",
+                        connection_id=connection_id,
+                        client_port=client_port,
+                        target=self._target.name,
+                    )
+                    self._unregister_pending_verification(connection_id)
+                    pending_registered = False
+                elif self._is_recently_approved_ip(client_ip):
                     approved = True
                     self._verification.approve_request(connection_id)
                     self._append_connection_audit(
@@ -509,6 +549,7 @@ class TargetProxy:
             lock_ok, lock_reason = self._acquire_forwarding_slot_or_disconnect(
                 client=client,
                 timeout_seconds=self._forwarding_slot_wait_seconds,
+                is_approved=approved,
             )
             if not lock_ok:
                 log_with_data(
@@ -767,9 +808,17 @@ class TargetProxy:
         self,
         client: socket.socket,
         timeout_seconds: int,
+        is_approved: bool = False,
     ) -> tuple[bool, str]:
-        deadline = time.time() + max(0, timeout_seconds)
+        # 已放行的连接获得更长的超时或优先权
+        effective_timeout = timeout_seconds
+        if is_approved:
+            effective_timeout = max(timeout_seconds, timeout_seconds * 2)
+        
+        deadline = time.time() + max(0, effective_timeout)
         waiting_logged = False
+        # 已放行连接使用更短的select超时以获得更多的锁获取机会
+        select_timeout = 0.05 if is_approved else 0.2
 
         while time.time() < deadline:
             if self._single_session_lock.acquire(blocking=False):
@@ -782,11 +831,12 @@ class TargetProxy:
                     "Forwarding slot busy, waiting",
                     target=self._target.name,
                     wait_seconds=timeout_seconds,
+                    priority="high" if is_approved else "normal",
                 )
                 waiting_logged = True
 
             try:
-                readable, _, _ = select.select([client], [], [], 0.2)
+                readable, _, _ = select.select([client], [], [], select_timeout)
             except (OSError, ValueError):
                 log_with_data(
                     self._logger,
