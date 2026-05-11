@@ -28,6 +28,7 @@ class ControlRequestEvent:
     approved_at: float | None = None
     closed_at: float | None = None
     close_reason: str = ""
+    quick_approval_token: str = ""
     wait_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
 
@@ -125,6 +126,56 @@ class ControlCenterService:
             if event is None:
                 return False
             return event.status == "rejected"
+
+    def is_pending_quick_approval(self, request_id: str) -> bool:
+        """检查请求是否待快速授权"""
+        with self._lock:
+            event = self._requests_by_id.get(request_id)
+            if event is None:
+                return False
+            return event.status == "pending_quick_approval"
+
+    def get_request_quick_approval_token(self, request_id: str) -> str | None:
+        """获取请求的快速授权令牌"""
+        with self._lock:
+            event = self._requests_by_id.get(request_id)
+            if event is None:
+                return None
+            return event.quick_approval_token if event.quick_approval_token else None
+
+    def approve_by_quick_token(self, quick_token: str) -> bool:
+        """通过快速授权令牌来放行请求"""
+        if not quick_token:
+            return False
+
+        now = time.time()
+        with self._lock:
+            # 寻找匹配的请求
+            for event in self._requests_by_id.values():
+                if event.quick_approval_token == quick_token and event.status == "pending_quick_approval":
+                    event.status = "approved"
+                    event.approved_at = now
+                    aggregate = self._requests_by_key.get((event.target, event.client_ip))
+                    if aggregate is not None:
+                        aggregate.status = "approved"
+                        aggregate.approved_count += 1
+                        aggregate.active_approved_at = now
+                        aggregate.last_state_change_at = now
+                    self._total_approved_count += 1
+                    self._whitelist_set.add((event.target, event.client_ip))
+                    event.wait_event.set()
+                    log_with_data(
+                        self._logger,
+                        logging.INFO,
+                        "Request approved by quick token",
+                        request_id=event.request_id,
+                        target=event.target,
+                        client_ip=event.client_ip,
+                    )
+                    if self._on_approved:
+                        self._on_approved(event.request_id, self._event_meta(event))
+                    return True
+        return False
 
     def blacklist_targets(self, targets: list[tuple[str, str]]) -> None:
         """批量加入黑名单，targets 为 [(target, client_ip), ...]"""
@@ -234,27 +285,30 @@ class ControlCenterService:
                 )
                 return event.wait_event
 
-            # 检查是否在白名单中，如果在直接放行
+            # 检查是否在白名单中，如果在则发送快速授权令牌（不自动放行）
             if key in self._whitelist_set:
-                event.status = "approved"
-                event.approved_at = now
-                event.wait_event.set()
+                event.status = "pending_quick_approval"
+                event.quick_approval_token = uuid4().hex
                 aggregate = self._requests_by_key.get(key)
                 if aggregate is None:
                     aggregate = ControlRequestAggregate(target=target, client_ip=client_ip, geo_text=geo_text)
                     self._requests_by_key[key] = aggregate
-                aggregate.status = "approved"
-                aggregate.approved_count += 1
-                aggregate.active_approved_at = now
+                aggregate.status = "pending"
+                aggregate.request_count += 1
+                aggregate.last_requested_at = now
+                if aggregate.first_requested_at <= 0:
+                    aggregate.first_requested_at = now
+                aggregate.active_request_id = connection_id
+                aggregate.active_connection_id = connection_id
+                aggregate.active_requested_at = now
+                aggregate.last_state_change_at = now
                 self._requests_by_id[connection_id] = event
                 self._request_history.append(event)
-                self._total_approved_count += 1
-                if self._on_approved:
-                    self._on_approved(connection_id, self._event_meta(event))
+                self._total_requested_count += 1
                 log_with_data(
                     self._logger,
                     logging.INFO,
-                    "Request auto-approved - target in whitelist",
+                    "Request pending quick approval - target in whitelist",
                     target=target,
                     client_ip=client_ip,
                 )
@@ -485,6 +539,10 @@ class ControlCenterService:
                     self._handle_action(parsed)
                     return
                 self._send_html(HTTPStatus.NOT_FOUND, "Not Found")
+                if parsed.path == "/quick-approve":
+                    self._handle_quick_approve(parsed)
+                    return
+                self._send_html(HTTPStatus.NOT_FOUND, "Not Found")
 
             def do_POST(self) -> None:
                 parsed = urlparse(self.path)
@@ -550,6 +608,19 @@ class ControlCenterService:
                     self._send_html(HTTPStatus.OK, self._close_page_html(f"已添加 {len(targets)} 个目标到黑名单"))
                 except Exception as e:
                     self._send_html(HTTPStatus.BAD_REQUEST, self._close_page_html(f"黑名单操作失败: {str(e)}"))
+
+            def _handle_quick_approve(self, parsed) -> None:
+                """处理快速授权链接"""
+                quick_token = parse_qs(parsed.query).get("token", [""])[0]
+                if not quick_token:
+                    self._send_html(HTTPStatus.BAD_REQUEST, self._close_page_html("缺少授权令牌"))
+                    return
+
+                if not service.approve_by_quick_token(quick_token):
+                    self._send_html(HTTPStatus.GONE, self._close_page_html("链接已失效或已被使用"))
+                    return
+
+                self._send_html(HTTPStatus.OK, self._close_page_html("请求已通过快速授权"))
 
 
             def _handle_action(self, parsed) -> None:

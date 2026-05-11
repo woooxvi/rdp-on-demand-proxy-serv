@@ -127,6 +127,29 @@ class Notifier:
         results, _ = self._broadcast(title, text)
         return results
 
+    def send_quick_approval(self, target: str, client_ip: str, quick_approve_url: str) -> dict[str, bool]:
+        """发送快速授权链接"""
+        title = "RDP 快速授权通知"
+        origin = self._format_origin(client_ip)
+        now_text = self._format_time()
+        text = (
+            f"来自 {origin} 的请求需要快速授权\n"
+            f"目标: {target}\n"
+            f"时间: {now_text}\n"
+            f"点击即放行: {quick_approve_url}"
+        )
+
+        telegram_text = (
+            f"<b>{self._escape_html(title)}</b>\n\n"
+            f"来自 {self._escape_html(origin)} 的请求需要快速授权\n"
+            f"目标: {self._escape_html(target)}\n"
+            f"时间: {self._escape_html(now_text)}\n"
+            f"<b><a href='{self._escape_html(quick_approve_url)}'>点击即放行</a></b>"
+        )
+
+        results, _ = self._broadcast(title, text, telegram_text=telegram_text, telegram_parse_mode="HTML")
+        return results
+
     def send_control_summary(self, window_seconds: int, requested_count: int, approved_count: int, summary_url: str) -> dict[str, bool]:
         window_seconds = max(1, int(window_seconds))
         hours = max(1, window_seconds // 3600)

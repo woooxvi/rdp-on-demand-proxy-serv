@@ -436,24 +436,96 @@ class TargetProxy:
                     self._verification.close_request(connection_id, "blacklisted")
                     return
 
-                # 检查是否被自动白名单放行
-                req_status = self._verification.get_request_status(connection_id)
-                if req_status == "approved":
-                    approved = True
+                # 检查是否待快速授权（白名单）
+                if self._verification.is_pending_quick_approval(connection_id):
+                    quick_token = self._verification.get_request_quick_approval_token(connection_id)
+                    quick_approve_url = f"{self._verification._external_base_url}/quick-approve?token={quick_token}"
                     log_with_data(
                         self._logger,
                         logging.INFO,
-                        "Connection auto-approved - target in whitelist",
+                        "Sending quick approval notification - target in whitelist",
                         connection_id=connection_id,
                         client_ip=client_ip,
                         target=self._target.name,
                     )
                     self._append_connection_audit(
-                        "verification_auto_approved_whitelist",
+                        "quick_approval_notification_sent",
                         connection_id=connection_id,
                         client_port=client_port,
                         target=self._target.name,
                     )
+                    # 发送快速授权通知给所有启用的通知方式
+                    self._notifier.send_quick_approval(self._target.name, client_ip, quick_approve_url)
+                    # 然后继续等待验证
+                    stage = "wait_verification"
+                    wait_start_ts = time.time()
+                    self._append_connection_audit(
+                        "verification_wait_started",
+                        connection_id=connection_id,
+                        client_port=client_port,
+                        target=self._target.name,
+                        wait_seconds=self._verification_wait_seconds,
+                    )
+                    approved, wait_reason = self._wait_for_verification_or_disconnect(
+                        client=client,
+                        event=evt,
+                        timeout_seconds=self._verification_wait_seconds,
+                    )
+                    self._append_connection_audit(
+                        "verification_wait_finished",
+                        connection_id=connection_id,
+                        client_port=client_port,
+                        target=self._target.name,
+                        approved=approved,
+                        reason=wait_reason,
+                        waited_seconds=round(time.time() - wait_start_ts, 2),
+                    )
+                    if not approved and wait_reason == "client_disconnected":
+                        self._verification.close_request(connection_id, wait_reason)
+                        self._append_connection_audit(
+                            "verification_cancelled",
+                            connection_id=connection_id,
+                            client_port=client_port,
+                            target=self._target.name,
+                            reason=wait_reason,
+                        )
+                        self._append_connection_audit(
+                            "connection_aborted",
+                            connection_id=connection_id,
+                            client_port=client_port,
+                            target=self._target.name,
+                            stage=stage,
+                            reason=wait_reason,
+                        )
+                        return
+                    if not approved:
+                        log_with_data(
+                            self._logger,
+                            logging.WARNING,
+                            "Quick approval timeout",
+                            connection_id=connection_id,
+                            client_ip=client_ip,
+                            target=self._target.name,
+                        )
+                        self._verification.close_request(connection_id, wait_reason)
+                        self._append_connection_audit(
+                            "quick_approval_timeout",
+                            connection_id=connection_id,
+                            client_port=client_port,
+                            target=self._target.name,
+                            wait_seconds=self._verification_wait_seconds,
+                            reason=wait_reason,
+                        )
+                        if self._deny_if_timeout:
+                            self._append_connection_audit(
+                                "connection_aborted",
+                                connection_id=connection_id,
+                                client_port=client_port,
+                                target=self._target.name,
+                                stage=stage,
+                                reason="quick_approval_timeout_deny",
+                            )
+                            return
                     self._unregister_pending_verification(connection_id)
                     pending_registered = False
                 elif self._is_recently_approved_ip(client_ip):
