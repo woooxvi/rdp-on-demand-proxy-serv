@@ -5,7 +5,7 @@
 ## 主要能力
 
 - 监听 RDP 端口并保持 TCP 连接不立即断开
-- 一次性验证链接放行（默认 5 分钟有效）
+- 控制中心按需放行（启动时生成唯一控制地址）
 - 自动检查 CVM 状态，按需开机并轮询等待
 - 支持阿里云 ECS 状态查询、开机、关机
 - 云主机就绪后执行 RDP TCP 透明双向转发
@@ -18,7 +18,7 @@
 - `run.py`: 启动入口
 - `rdp_proxy/app.py`: 进程入口与信号处理
 - `rdp_proxy/proxy.py`: 核心代理流程、开机等待、转发、空闲关机
-- `rdp_proxy/verification.py`: 一次性验证 HTTP 服务
+- `rdp_proxy/control_center.py`: 控制中心 HTTP 服务与请求内存记录
 - `rdp_proxy/notifications.py`: Telegram / 钉钉 / 企业微信通知
 - `rdp_proxy/cloud/tencent_cvm.py`: 腾讯云 CVM 实现
 - `config.example.json`: 配置模板
@@ -35,7 +35,7 @@ cp config.example.yml config.yml
 
 必须配置：
 
-- `server.external_verify_base_url`: 可被你点击访问的公网地址
+- `server.external_control_base_url`: 可被你点击访问的公网控制地址
 - `notifications.telegram.bot_token`
 - `notifications.telegram.chat_id`
 - `targets[].cloud.secret_id`
@@ -55,9 +55,9 @@ python run.py --config config.yml
 
 ### 3. 连接流程
 
-1. 使用 `mstsc` 连接代理 IP:端口
-2. 服务保持连接并发送 Telegram 验证消息
-3. 点击一次性链接放行
+1. 使用 `mstsc` 连接代理 IP:端口，服务只记录请求到内存，不再主动发送单请求授权消息
+2. 服务启动时会向 IM 发送一条控制中心链接，点击后可查看当前已放行与挂起请求
+3. 在控制页点记录并确认放行
 4. 服务按需开机并在就绪后开始 RDP 透明转发
 5. 断开后进入空闲计时，超时自动关机
 
@@ -124,9 +124,9 @@ sudo systemctl status rdp-proxy
 - `targets[].cloud`: 设为空对象 `{}`（或省略）时跳过云状态检查与自动关机，适合仅调试代理/通知/授权
 - `targets[].cloud.stop_mode`: 腾讯云停机模式，建议 `STOP_CHARGING`
 - `targets[].cloud.provider`: `tencent_cvm` 或 `aliyun_ecs`
-- `security.wait_for_verification_seconds`: 等待验证时间
-- `security.forwarding_slot_wait_seconds`: 验证通过后等待转发槽位时间（默认 120）。当目标已有会话占用时，新连接会在该时间内排队等待放通。
-- `security.verification_notify_delay_seconds`: 验证通知延迟窗口（默认 2 秒）。连接在该窗口内断开时，不发送连接请求通知，可抑制扫描噪声。
+- `security.wait_for_verification_seconds`: 等待控制页放行的时间
+- `security.forwarding_slot_wait_seconds`: 放行后等待转发槽位时间（默认 120）。当目标已有会话占用时，新连接会在该时间内排队等待放通。
+- `security.verification_notify_delay_seconds`: 连接噪声观察窗口（默认 2 秒）。连接在该窗口内断开时，不会进入控制中心待授权列表，可抑制扫描噪声。
 - `security.max_pending_verification_connections`: 待授权连接池总上限（默认 5）。
 - `security.max_pending_verifications_per_ip`: 同源 IP 待授权并发上限（默认 1）。
 - `security.approved_ip_reuse_seconds`: 某 IP 授权成功后，N 秒内新连接免二次授权（默认 60）。
@@ -138,10 +138,10 @@ sudo systemctl status rdp-proxy
 通知策略：
 
 - 所有 `enabled: true` 的通知通道都会并行尝试发送，不会只发一个通道。
-- RDP 连接验证仍按每次连接发送，不会因短时间重连而跳过验证。
-- 连接验证通知会在 `security.verification_notify_delay_seconds` 观察窗口后发送；若连接很快断开，则不发送通知。
-- 如果客户端在等待授权阶段已经断开，该次验证 token 会被立即作废；点击旧链接会提示失效，避免“无意义授权”影响后续连接。
-- Telegram 的“连接验证请求”消息会在验证链接过期后自动尝试删除（默认 5 分钟，与 `security.token_ttl_seconds` 一致）。
+- 新连接到达时只记录到内存，不再向 IM 主动发送单条授权消息。
+- 服务启动时会向 IM 发送一条控制中心地址，后续点击该地址可查看当前已放行和挂起请求，并对请求做人工放行。
+- 每隔 `notifications.control_summary_interval_seconds` 会向 IM 发送一条最近时间窗口的摘要消息，点击后可查看请求记录。
+- 如果客户端在等待放行阶段已经断开，该次请求会从控制中心中关闭，避免“无意义放行”影响后续连接。
 - Telegram 的“连接断开提醒”不会定时删除；当下一次连接真正建立转发后，会自动尝试删除上一条断开提醒。
 - 断开提醒采用 30 秒观察窗口：若断开后 30 秒内出现新连接，会抑制上一条断开提醒，减少“密码阶段二次建连”噪声。
 - 通知中的来源 IP 默认脱敏为“IP 尾号”。
@@ -223,7 +223,7 @@ python run.py --config config.yml --self-check cloud --cloud-check-operation sto
 ## 注意事项
 
 - 默认实现为“先验证后开机”，可减少误触发开机成本。
-- `verify_http_port` 与 RDP 端口通常应分离；HTTP 验证链接需可公网访问。
+- `control_http_port` 与 RDP 端口通常应分离；HTTP 控制地址需可公网访问。
 - 当前并发策略：允许多个连接同时进入“待授权”阶段（默认最多 5 条、同源 IP 最多 1 条），但同一目标同一时刻只放通 1 条转发会话。
 - 当某条连接被授权后，会清理其他不同 IP 的待授权连接，避免恶意占坑导致长期阻塞。
 - 如果需要 YAML 配置，请额外安装 `PyYAML`。

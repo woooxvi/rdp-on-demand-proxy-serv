@@ -9,9 +9,9 @@ from typing import Any
 @dataclass(frozen=True)
 class ServerConfig:
     bind: str
-    verify_http_bind: str
-    verify_http_port: int
-    external_verify_base_url: str
+    control_http_bind: str
+    control_http_port: int
+    external_control_base_url: str
     max_pending_connections: int = 50
     access_log_details: bool = True
 
@@ -81,6 +81,7 @@ class NotificationsConfig:
     wecom: WeComConfig
     privacy: NotificationPrivacyConfig
     geoip: GeoIPConfig
+    control_summary_interval_seconds: int = 3600
     timezone: str = "server"
 
 
@@ -199,9 +200,9 @@ def load_config(config_path: str) -> AppConfig:
     return AppConfig(
         server=ServerConfig(
             bind=server.get("bind", "0.0.0.0"),
-            verify_http_bind=server.get("verify_http_bind", "0.0.0.0"),
-            verify_http_port=int(server.get("verify_http_port", 8080)),
-            external_verify_base_url=server["external_verify_base_url"],
+            control_http_bind=server.get("control_http_bind", server.get("verify_http_bind", "0.0.0.0")),
+            control_http_port=int(server.get("control_http_port", server.get("verify_http_port", 8080))),
+            external_control_base_url=server.get("external_control_base_url", server.get("external_verify_base_url", "")),
             max_pending_connections=int(server.get("max_pending_connections", 50)),
             access_log_details=bool(server.get("access_log_details", True)),
         ),
@@ -248,6 +249,7 @@ def load_config(config_path: str) -> AppConfig:
                 update_account_id=str(geoip_update_raw.get("account_id", "")).strip(),
                 update_license_key=str(geoip_update_raw.get("license_key", "")).strip(),
             ),
+            control_summary_interval_seconds=int(notifications.get("control_summary_interval_seconds", 3600)),
             timezone=str(notifications.get("timezone", "server")).strip(),
         ),
         targets=targets,
