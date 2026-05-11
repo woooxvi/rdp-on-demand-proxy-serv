@@ -1305,7 +1305,7 @@ class RDPProxyApp:
             port=cfg.server.control_http_port,
             external_base_url=cfg.server.external_control_base_url,
             ttl_seconds=cfg.security.token_ttl_seconds,
-            on_verified=self._handle_verification_approved,
+            on_approved=self._handle_verification_approved,
             on_action=self._handle_post_disconnect_action,
         )
         self._notifier = Notifier(cfg.notifications)
