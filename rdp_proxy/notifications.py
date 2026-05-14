@@ -29,9 +29,11 @@ from rdp_proxy.logging_utils import log_with_data
 
 
 class Notifier:
-    def __init__(self, config: NotificationsConfig):
+    def __init__(self, config: NotificationsConfig, verification_message_ttl_seconds: int = 300):
         self._cfg = config
+        self._verification_message_ttl_seconds = max(1, int(verification_message_ttl_seconds))
         self._logger = logging.getLogger("rdp_proxy.notifications")
+        self._telegram_verification_messages: dict[str, list[int]] = {}
         self._telegram_disconnect_messages: dict[str, list[int]] = {}
         self._geoip_cache: dict[str, tuple[float, str]] = {}
         self._geo_city_reader = None
@@ -117,52 +119,53 @@ class Notifier:
             # IANA timezone
             return datetime.now(self._timezone_obj).isoformat(sep=' ', timespec='seconds')
 
-    def send_control_startup(self, control_url: str) -> dict[str, bool]:
-        title = "RDP 控制中心已启动"
-        text = (
-            f"本次服务启动的控制地址:\n"
-            f"{control_url}\n"
-            f"点击后可查看当前已放行和挂起的 RDP 请求"
-        )
-        results, _ = self._broadcast(title, text)
-        return results
-
-    def send_quick_approval(self, target: str, client_ip: str, quick_approve_url: str) -> dict[str, bool]:
-        """发送快速授权链接"""
-        title = "RDP 快速授权通知"
+    def send_verification(self, client_ip: str, target: TargetConfig, verify_url: str, token: str = "") -> None:
+        title = "RDP 登录请求提醒"
+        instance_id = target.cloud.instance_id if target.cloud else "N/A"
         origin = self._format_origin(client_ip)
-        now_text = self._format_time()
+        time_str = self._format_time()
         text = (
-            f"来自 {origin} 的请求需要快速授权\n"
-            f"目标: {target}\n"
-            f"时间: {now_text}\n"
-            f"点击即放行: {quick_approve_url}"
+            f"来自 {origin} 的 RDP 访问请求，点击链接允许连接\n"
+            f"实例: {instance_id}\n"
+            f"目标IP: {target.target_ip}\n"
+            f"时间: {time_str}\n"
+            f"验证链接: {verify_url}"
         )
 
         telegram_text = (
             f"<b>{self._escape_html(title)}</b>\n\n"
-            f"来自 {self._escape_html(origin)} 的请求需要快速授权\n"
-            f"目标: {self._escape_html(target)}\n"
-            f"时间: {self._escape_html(now_text)}\n"
-            f"<b><a href='{self._escape_html(quick_approve_url)}'>点击即放行</a></b>"
+            f"来自 {self._escape_html(origin)} 的 RDP 访问请求，点击链接允许连接\n"
+            f"实例: {self._escape_html(instance_id)}\n"
+            f"目标IP: {self._escape_html(target.target_ip)}\n"
+            f"时间: {self._escape_html(time_str)}\n"
+            f"验证链接: {self._escape_html(verify_url)}"
         )
 
-        results, _ = self._broadcast(title, text, telegram_text=telegram_text, telegram_parse_mode="HTML")
-        return results
-
-    def send_control_summary(self, window_seconds: int, requested_count: int, approved_count: int, summary_url: str) -> dict[str, bool]:
-        window_seconds = max(1, int(window_seconds))
-        hours = max(1, window_seconds // 3600)
-        minutes = max(1, window_seconds // 60)
-        window_label = f"{hours}h" if window_seconds >= 3600 else f"{minutes}m"
-        title = "RDP 控制中心摘要"
-        text = (
-            f"最近 {window_label} 请求次数: {requested_count}\n"
-            f"最近 {window_label} 放行次数: {approved_count}\n"
-            f"查看记录:\n{summary_url}"
+        results, telegram_message_id = self._broadcast(
+            title,
+            text,
+            telegram_text=telegram_text,
+            telegram_parse_mode="HTML",
         )
-        results, _ = self._broadcast(title, text)
-        return results
+        if token and telegram_message_id is not None:
+            with self._lock:
+                self._telegram_verification_messages.setdefault(token, []).append(telegram_message_id)
+            threading.Thread(
+                target=self._delete_verification_message_after_ttl,
+                args=(token, telegram_message_id),
+                name="tg-verify-auto-delete",
+                daemon=True,
+            ).start()
+        sent = any(results.values())
+
+        if not sent:
+            log_with_data(
+                self._logger,
+                logging.WARNING,
+                "No notification was sent",
+                client_ip=client_ip,
+                target=target.name,
+            )
 
     def send_disconnect_options(
         self,
@@ -218,6 +221,26 @@ class Notifier:
         results, _ = self._broadcast(title, text)
         return results
 
+    def on_verification_approved(self, token: str) -> None:
+        if not token:
+            return
+        if not self._cfg.telegram.enabled:
+            return
+
+        with self._lock:
+            message_ids = list(self._telegram_verification_messages.pop(token, []))
+
+        for message_id in message_ids:
+            ok = self._delete_telegram_message(message_id)
+            log_with_data(
+                self._logger,
+                logging.INFO,
+                "Telegram verification message delete attempted",
+                token=token,
+                message_id=message_id,
+                deleted=ok,
+            )
+
     def on_connection_established(self, target_name: str) -> None:
         if not target_name:
             return
@@ -237,6 +260,34 @@ class Notifier:
                 message_id=message_id,
                 deleted=ok,
             )
+
+    def _delete_verification_message_after_ttl(self, token: str, message_id: int) -> None:
+        time.sleep(self._verification_message_ttl_seconds)
+
+        if not self._cfg.telegram.enabled:
+            return
+
+        should_delete = False
+        with self._lock:
+            msg_ids = self._telegram_verification_messages.get(token, [])
+            if message_id in msg_ids:
+                msg_ids.remove(message_id)
+                should_delete = True
+                if not msg_ids:
+                    self._telegram_verification_messages.pop(token, None)
+
+        if not should_delete:
+            return
+
+        ok = self._delete_telegram_message(message_id)
+        log_with_data(
+            self._logger,
+            logging.INFO,
+            "Telegram verification message auto-delete attempted",
+            token=token,
+            message_id=message_id,
+            deleted=ok,
+        )
 
     def send_cloud_operation_result(
         self,

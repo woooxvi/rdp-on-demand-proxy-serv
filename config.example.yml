@@ -28,7 +28,6 @@ whitelist:
   k8_secret_key: list.json
 
 notifications:
-  control_summary_interval_seconds: 3600
   telegram:
     enabled: true
     bot_token: YOUR_TELEGRAM_BOT_TOKEN

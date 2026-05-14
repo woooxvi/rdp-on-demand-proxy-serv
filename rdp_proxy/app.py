@@ -199,15 +199,15 @@ def _assert_bindable(host: str, port: int, name: str) -> None:
 def _validate_ports(cfg) -> None:
     used: set[tuple[str, int]] = set()
 
-    control_key = (cfg.server.control_http_bind, cfg.server.control_http_port)
-    _assert_bindable(cfg.server.control_http_bind, cfg.server.control_http_port, "control_http")
-    used.add(control_key)
+    verify_key = (cfg.server.verify_http_bind, cfg.server.verify_http_port)
+    _assert_bindable(cfg.server.verify_http_bind, cfg.server.verify_http_port, "verification_http")
+    used.add(verify_key)
 
     for target in cfg.targets:
         key = (cfg.server.bind, target.listen_port)
         if key in used:
             raise RuntimeError(
-                f"Startup aborted: duplicate bind detected on {key[0]}:{key[1]} (control_http/target listen conflict or duplicate target)"
+                f"Startup aborted: duplicate bind detected on {key[0]}:{key[1]} (verification_http/target listen conflict or duplicate target)"
             )
         _assert_bindable(cfg.server.bind, target.listen_port, f"target:{target.name}")
         used.add(key)
