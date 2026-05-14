@@ -32,6 +32,16 @@ class SecurityConfig:
 
 
 @dataclass(frozen=True)
+class WhitelistConfig:
+    enabled: bool = True
+    path: str = "/list.json"
+    storage: str = "filesystem"
+    k8_secret_name: str = "rdp-proxy-list"
+    k8_secret_namespace: str = ""
+    k8_secret_key: str = "list.json"
+
+
+@dataclass(frozen=True)
 class TelegramConfig:
     enabled: bool
     bot_token: str
@@ -111,6 +121,7 @@ class TargetConfig:
 class AppConfig:
     server: ServerConfig
     security: SecurityConfig
+    whitelist: WhitelistConfig
     notifications: NotificationsConfig
     targets: list[TargetConfig]
 
@@ -138,6 +149,7 @@ def load_config(config_path: str) -> AppConfig:
 
     server = raw["server"]
     security = raw["security"]
+    whitelist_raw = raw.get("whitelist", {})
     notifications = raw["notifications"]
     geoip_raw = notifications.get("geoip", {})
     geoip_update_raw = geoip_raw.get("update", {})
@@ -217,6 +229,14 @@ def load_config(config_path: str) -> AppConfig:
             approved_ip_reuse_seconds=int(security.get("approved_ip_reuse_seconds", 60)),
             per_ip_connection_rate_window_seconds=int(security.get("per_ip_connection_rate_window_seconds", 5)),
             per_ip_connection_rate_limit=int(security.get("per_ip_connection_rate_limit", 4)),
+        ),
+        whitelist=WhitelistConfig(
+            enabled=bool(whitelist_raw.get("enabled", True)),
+            path=str(whitelist_raw.get("path", "/list.json")).strip() or "/list.json",
+            storage=str(whitelist_raw.get("storage", "filesystem")).strip().lower() or "filesystem",
+            k8_secret_name=str(whitelist_raw.get("k8_secret_name", "rdp-proxy-list")).strip() or "rdp-proxy-list",
+            k8_secret_namespace=str(whitelist_raw.get("k8_secret_namespace", "")).strip(),
+            k8_secret_key=str(whitelist_raw.get("k8_secret_key", "list.json")).strip() or "list.json",
         ),
         notifications=NotificationsConfig(
             telegram=TelegramConfig(

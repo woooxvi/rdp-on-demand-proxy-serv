@@ -12,6 +12,7 @@
 - 空闲超时自动关机，支持 `STOP_CHARGING`
 - 结构化 JSON 日志，记录连接、状态变化、验证、转发、关机
 - 单目标单会话并发控制（多余连接拒绝）
+- 白名单持久化到 `list.json`，支持文件模式和 K8 Secret 模式
 
 ## 项目结构
 
@@ -19,9 +20,10 @@
 - `rdp_proxy/app.py`: 进程入口与信号处理
 - `rdp_proxy/proxy.py`: 核心代理流程、开机等待、转发、空闲关机
 - `rdp_proxy/verification.py`: 一次性验证 HTTP 服务
+- `rdp_proxy/whitelist.py`: 白名单持久化与入站消息处理
 - `rdp_proxy/notifications.py`: Telegram / 钉钉 / 企业微信通知
 - `rdp_proxy/cloud/tencent_cvm.py`: 腾讯云 CVM 实现
-- `config.example.json`: 配置模板
+- `config.example.yml`: 配置模板
 
 ## 快速开始
 
@@ -56,10 +58,30 @@ python run.py --config config.yml
 ### 3. 连接流程
 
 1. 使用 `mstsc` 连接代理 IP:端口
-2. 服务保持连接并发送 Telegram 验证消息
-3. 点击一次性链接放行
-4. 服务按需开机并在就绪后开始 RDP 透明转发
+2. 如果来源 IP 不在白名单中，连接会被直接拒绝
+3. 白名单中的 IP 会继续进入原有 IM 授权流程
+4. 点击一次性链接放行后，服务按需开机并在就绪后开始 RDP 透明转发
 5. 断开后进入空闲计时，超时自动关机
+
+### 连接白名单
+
+白名单文件默认写到 `/list.json`。文件内容保存的是 IP 的单向摘要，不是明文 IP。
+
+如果你要从 IM 里新增白名单 IP，只需要把收到的纯 IP 文本转发到本服务的 `POST /whitelist`：
+
+```bash
+curl -X POST http://YOUR_PROXY_PUBLIC_IP:8080/whitelist \
+  -H "Content-Type: text/plain" \
+  --data "203.0.113.10"
+```
+
+也支持 JSON：
+
+```json
+{ "text": "2001:db8::10" }
+```
+
+K8 模式下，程序会通过 Kubernetes API 更新挂载的 Secret，前提是 Pod 对应 ServiceAccount 具备写权限。
 
 ## Docker 部署
 
@@ -132,6 +154,11 @@ sudo systemctl status rdp-proxy
 - `security.approved_ip_reuse_seconds`: 某 IP 授权成功后，N 秒内新连接免二次授权（默认 60）。
 - `security.per_ip_connection_rate_window_seconds`: 同源 IP 新建连接限流窗口秒数（默认 5）。
 - `security.per_ip_connection_rate_limit`: 同源 IP 每个窗口允许的新建连接数（默认 4）。超出后连接会等待到下一个窗口再继续。
+- `whitelist.path`: 白名单文件路径，默认 `/list.json`。
+- `whitelist.storage`: `filesystem` 表示直接写文件，`k8` 表示通过 Kubernetes Secret 更新挂载内容。
+- `whitelist.k8_secret_name`: K8 模式下要更新的 Secret 名称。
+- `whitelist.k8_secret_namespace`: K8 模式下 Secret 所在命名空间，留空时自动读取当前 Pod 命名空间。
+- `whitelist.k8_secret_key`: K8 模式下写入 Secret 的 key，默认 `list.json`。
 - `notifications.telegram.insecure_skip_verify`: 仅在本机证书链异常时用于调试，`true` 会跳过 Telegram HTTPS 证书校验
 - `notifications.dingtalk.secret`: 钉钉加签密钥，开启机器人加签时必填
 
@@ -145,6 +172,9 @@ sudo systemctl status rdp-proxy
 - Telegram 的“连接断开提醒”不会定时删除；当下一次连接真正建立转发后，会自动尝试删除上一条断开提醒。
 - 断开提醒采用 30 秒观察窗口：若断开后 30 秒内出现新连接，会抑制上一条断开提醒，减少“密码阶段二次建连”噪声。
 - 通知中的来源 IP 默认脱敏为“IP 尾号”。
+- 连接访问控制先检查白名单，`list.json` 中没有的 IP 会直接拒绝，不再进入 IM 授权流程。
+- 白名单内容使用 IP 的单向摘要存储，配置文件中不会落明文 IP。
+- 收到纯 IP 文本后，会写入白名单并立即生效；可以通过入站消息桥接到 `POST /whitelist`。
 - 可选开启 `notifications.geoip.enabled` 获取来源城市 + ASN 信息，推荐离线模式：`notifications.geoip.mode=offline`。
 - 离线模式需要本地数据库文件：`notifications.geoip.city_db_path`（GeoLite2-City.mmdb）与 `notifications.geoip.asn_db_path`（GeoLite2-ASN.mmdb）。
 - 兼容在线模式：`notifications.geoip.mode=online` 时仍支持 `endpoint_templates` 回退查询。

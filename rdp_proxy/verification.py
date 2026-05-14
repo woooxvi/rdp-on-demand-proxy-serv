@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import html
 import logging
 import threading
@@ -44,6 +45,7 @@ class VerificationService:
         ttl_seconds: int,
         on_verified: Callable[[str, dict], None] | None = None,
         on_action: Callable[[str, str], None] | None = None,
+        on_whitelist_message: Callable[[str], tuple[bool, str]] | None = None,
     ):
         self._bind = bind
         self._port = port
@@ -55,6 +57,7 @@ class VerificationService:
         self._logger = logging.getLogger("rdp_proxy.verification")
         self._on_verified = on_verified
         self._on_action = on_action
+        self._on_whitelist_message = on_whitelist_message
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -175,6 +178,9 @@ class VerificationService:
                 if parsed.path == "/action":
                     self._handle_action(parsed)
                     return
+                if parsed.path == "/whitelist":
+                    self._handle_whitelist(parsed)
+                    return
                 if parsed.path != "/verify":
                     self._send_html(HTTPStatus.NOT_FOUND, "Not Found")
                     return
@@ -250,6 +256,68 @@ class VerificationService:
                     self._send_html(HTTPStatus.OK, "已选择：立即关机（空闲超时后执行）")
                     return
                 self._send_html(HTTPStatus.OK, "已选择：保持开机")
+
+            def do_POST(self) -> None:
+                parsed = urlparse(self.path)
+                if parsed.path != "/whitelist":
+                    self._send_html(HTTPStatus.NOT_FOUND, "Not Found")
+                    return
+                self._handle_whitelist(parsed, allow_body=True)
+
+            def _handle_whitelist(self, parsed, allow_body: bool = False) -> None:
+                if not service._on_whitelist_message:
+                    self._send_html(HTTPStatus.NOT_IMPLEMENTED, "Whitelist ingestion is disabled")
+                    return
+
+                message = ""
+                if allow_body:
+                    length_text = self.headers.get("Content-Length", "0")
+                    try:
+                        content_length = max(0, int(length_text))
+                    except ValueError:
+                        content_length = 0
+                    raw_body = self.rfile.read(content_length).decode("utf-8", errors="replace") if content_length else ""
+                    content_type = self.headers.get("Content-Type", "")
+                    if "application/json" in content_type:
+                        try:
+                            payload = json.loads(raw_body or "{}")
+                        except ValueError:
+                            payload = {}
+                        if isinstance(payload, dict):
+                            for key in ("text", "content", "message", "ip"):
+                                value = payload.get(key)
+                                if isinstance(value, str) and value.strip():
+                                    message = value.strip()
+                                    break
+                            if not message:
+                                nested = payload.get("content")
+                                if isinstance(nested, dict):
+                                    for key in ("text", "message", "ip"):
+                                        value = nested.get(key)
+                                        if isinstance(value, str) and value.strip():
+                                            message = value.strip()
+                                            break
+                        if not message:
+                            message = raw_body.strip()
+                    else:
+                        message = raw_body.strip()
+                else:
+                    query = parse_qs(parsed.query)
+                    for key in ("text", "ip", "message"):
+                        values = query.get(key, [])
+                        if values and values[0].strip():
+                            message = values[0].strip()
+                            break
+
+                if not message:
+                    self._send_html(HTTPStatus.BAD_REQUEST, "Missing whitelist message")
+                    return
+
+                ok, detail = service._on_whitelist_message(message)
+                if ok:
+                    self._send_html(HTTPStatus.OK, f"Whitelist updated: {html.escape(detail)}")
+                    return
+                self._send_html(HTTPStatus.BAD_REQUEST, html.escape(detail))
 
             def log_message(self, format: str, *args) -> None:
                 return

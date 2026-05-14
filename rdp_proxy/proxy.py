@@ -16,6 +16,7 @@ from rdp_proxy.config import AppConfig, TargetConfig
 from rdp_proxy.logging_utils import log_with_data, sanitize_sensitive_log_fields
 from rdp_proxy.notifications import Notifier
 from rdp_proxy.verification import VerificationService
+from rdp_proxy.whitelist import WhitelistStore
 
 
 class TargetProxy:
@@ -35,6 +36,7 @@ class TargetProxy:
         approved_ip_reuse_seconds: int,
         per_ip_connection_rate_window_seconds: int,
         per_ip_connection_rate_limit: int,
+        whitelist: WhitelistStore,
     ):
         self._bind_host = bind_host
         self._target = target
@@ -45,6 +47,7 @@ class TargetProxy:
         self._verification_notify_delay_seconds = 2.0
         self._deny_if_timeout = deny_if_timeout
         self._max_pending_connections = max_pending_connections
+        self._whitelist = whitelist
         self._provider: CloudProvider | None = (
             create_provider(target.cloud) if target.cloud_control_enabled and target.cloud is not None else None
         )
@@ -352,6 +355,26 @@ class TargetProxy:
                 )
                 return
 
+            stage = "whitelist_check"
+            if not self._whitelist.contains(client_ip):
+                log_with_data(
+                    self._logger,
+                    logging.INFO,
+                    "Connection dropped by whitelist",
+                    connection_id=connection_id,
+                    client_ip=client_ip,
+                    client_port=client_port,
+                    target=self._target.name,
+                )
+                self._append_connection_audit(
+                    "connection_rejected",
+                    connection_id=connection_id,
+                    client_port=client_port,
+                    target=self._target.name,
+                    reason="not_whitelisted",
+                )
+                return
+
             if self._security_enabled:
                 if self._is_recently_approved_ip(client_ip):
                     approved = True
@@ -425,7 +448,6 @@ class TargetProxy:
                             "instance_id": self._target.cloud.instance_id if self._target.cloud else "N/A",
                         }
                     )
-                    self._notifier.send_verification(client_ip, self._target, url, token=token)
                     log_with_data(
                         self._logger,
                         logging.INFO,
@@ -1313,6 +1335,7 @@ class RDPProxyApp:
     def __init__(self, cfg: AppConfig):
         self._cfg = cfg
         self._logger = logging.getLogger("rdp_proxy.app")
+        self._whitelist = WhitelistStore(cfg.whitelist)
         self._verification = VerificationService(
             bind=cfg.server.verify_http_bind,
             port=cfg.server.verify_http_port,
@@ -1320,6 +1343,7 @@ class RDPProxyApp:
             ttl_seconds=cfg.security.token_ttl_seconds,
             on_verified=self._handle_verification_approved,
             on_action=self._handle_post_disconnect_action,
+            on_whitelist_message=self._handle_whitelist_message,
         )
         self._notifier = Notifier(cfg.notifications, verification_message_ttl_seconds=cfg.security.token_ttl_seconds)
         self._targets: list[TargetProxy] = [
@@ -1338,6 +1362,7 @@ class RDPProxyApp:
                 approved_ip_reuse_seconds=cfg.security.approved_ip_reuse_seconds,
                 per_ip_connection_rate_window_seconds=cfg.security.per_ip_connection_rate_window_seconds,
                 per_ip_connection_rate_limit=cfg.security.per_ip_connection_rate_limit,
+                whitelist=self._whitelist,
             )
             for t in cfg.targets
         ]
@@ -1375,6 +1400,10 @@ class RDPProxyApp:
             target=meta.get("target", "unknown"),
             client_ip=meta.get("client_ip", "unknown"),
         )
+
+    def _handle_whitelist_message(self, text: str) -> tuple[bool, str]:
+        result = self._whitelist.ingest_text(text)
+        return result.allowed, result.message
 
     def start(self) -> None:
         self._verification.start()

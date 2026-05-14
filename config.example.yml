@@ -19,6 +19,14 @@ security:
   per_ip_connection_rate_window_seconds: 5
   per_ip_connection_rate_limit: 4
 
+whitelist:
+  enabled: true
+  storage: filesystem # filesystem or k8
+  path: /list.json
+  k8_secret_name: rdp-proxy-list
+  k8_secret_namespace: ""
+  k8_secret_key: list.json
+
 notifications:
   telegram:
     enabled: true
