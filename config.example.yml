@@ -1,8 +1,8 @@
 server:
   bind: 0.0.0.0
-  control_http_bind: 0.0.0.0
-  control_http_port: 8080
-  external_control_base_url: http://YOUR_PROXY_PUBLIC_IP:8080
+  verify_http_bind: 0.0.0.0
+  verify_http_port: 8080
+  external_verify_base_url: http://YOUR_PROXY_PUBLIC_IP:8080
   max_pending_connections: 50
   access_log_details: false
 
