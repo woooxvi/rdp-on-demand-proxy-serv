@@ -13,9 +13,10 @@ from uuid import uuid4
 from rdp_proxy.cloud.base import CloudProvider
 from rdp_proxy.cloud.factory import create_provider
 from rdp_proxy.config import AppConfig, TargetConfig
-from rdp_proxy.control_center import ControlCenterService
 from rdp_proxy.logging_utils import log_with_data, sanitize_sensitive_log_fields
 from rdp_proxy.notifications import Notifier
+from rdp_proxy.verification import VerificationService
+from rdp_proxy.whitelist import WhitelistStore
 
 
 class TargetProxy:
@@ -24,7 +25,7 @@ class TargetProxy:
         bind_host: str,
         target: TargetConfig,
         notifier: Notifier,
-        verification: ControlCenterService,
+        verification: VerificationService,
         security_enabled: bool,
         verification_wait_seconds: int,
         deny_if_timeout: bool,
@@ -35,6 +36,7 @@ class TargetProxy:
         approved_ip_reuse_seconds: int,
         per_ip_connection_rate_window_seconds: int,
         per_ip_connection_rate_limit: int,
+        whitelist: WhitelistStore,
     ):
         self._bind_host = bind_host
         self._target = target
@@ -45,6 +47,7 @@ class TargetProxy:
         self._verification_notify_delay_seconds = 2.0
         self._deny_if_timeout = deny_if_timeout
         self._max_pending_connections = max_pending_connections
+        self._whitelist = whitelist
         self._provider: CloudProvider | None = (
             create_provider(target.cloud) if target.cloud_control_enabled and target.cloud is not None else None
         )
@@ -173,7 +176,6 @@ class TargetProxy:
                     "client_ip": str(old_payload.get("client_ip", "")),
                     "client_port": int(old_payload.get("client_port", 0)),
                 }
-                self._verification.close_request(old_conn_id, "same_ip_takeover")
                 old_sock = old_payload.get("socket")
                 if isinstance(old_sock, socket.socket):
                     replaced_sock = old_sock
@@ -353,184 +355,38 @@ class TargetProxy:
                 )
                 return
 
-            if self._security_enabled:
-                stage = "notify_delay_window"
-                if not self._wait_for_verification_notify_window(client):
-                    self._append_connection_audit(
-                        "verification_notify_suppressed",
-                        connection_id=connection_id,
-                        client_port=client_port,
-                        target=self._target.name,
-                        reason="client_disconnected_before_notify_window",
-                        delay_seconds=round(self._verification_notify_delay_seconds, 2),
-                    )
-                    self._append_connection_audit(
-                        "connection_aborted",
-                        connection_id=connection_id,
-                        client_port=client_port,
-                        target=self._target.name,
-                        stage=stage,
-                        reason="client_disconnected_before_notify_window",
-                    )
-                    return
-
-                stage = "create_verification"
-                can_wait, queue_reason, replaced = self._register_pending_verification(
+            stage = "whitelist_check"
+            if not self._whitelist.contains(client_ip):
+                log_with_data(
+                    self._logger,
+                    logging.INFO,
+                    "Connection dropped by whitelist",
                     connection_id=connection_id,
-                    client=client,
                     client_ip=client_ip,
                     client_port=client_port,
-                )
-                if not can_wait:
-                    self._append_connection_audit(
-                        "connection_rejected",
-                        connection_id=connection_id,
-                        client_port=client_port,
-                        target=self._target.name,
-                        reason=queue_reason,
-                    )
-                    return
-                if replaced:
-                    self._append_connection_audit(
-                        "pending_replaced_same_ip",
-                        connection_id=connection_id,
-                        client_port=client_port,
-                        target=self._target.name,
-                        replaced_connection_id=str(replaced.get("connection_id", "")),
-                        replaced_client_port=int(replaced.get("client_port", 0)),
-                    )
-                pending_registered = True
-                geo_text = self._notifier.resolve_geo_text(client_ip)
-                evt = self._verification.register_request(
                     target=self._target.name,
-                    connection_id=connection_id,
-                    client_ip=client_ip,
-                    client_port=client_port,
-                    geo_text=geo_text,
                 )
                 self._append_connection_audit(
-                    "verification_recorded",
+                    "connection_rejected",
                     connection_id=connection_id,
                     client_port=client_port,
                     target=self._target.name,
-                    geo_text=geo_text,
+                    reason="not_whitelisted",
                 )
+                return
 
-                # 检查是否被黑名单拒绝
-                if self._verification.is_request_rejected(connection_id):
-                    log_with_data(
-                        self._logger,
-                        logging.INFO,
-                        "Connection rejected - target in blacklist",
-                        connection_id=connection_id,
-                        client_ip=client_ip,
-                        target=self._target.name,
-                    )
-                    self._append_connection_audit(
-                        "connection_rejected_blacklist",
-                        connection_id=connection_id,
-                        client_port=client_port,
-                        target=self._target.name,
-                    )
-                    self._unregister_pending_verification(connection_id)
-                    self._verification.close_request(connection_id, "blacklisted")
-                    return
-
-                # 检查是否待快速授权（白名单）
-                if self._verification.is_pending_quick_approval(connection_id):
-                    quick_token = self._verification.get_request_quick_approval_token(connection_id)
-                    quick_approve_url = f"{self._verification._external_base_url}/quick-approve?token={quick_token}"
-                    log_with_data(
-                        self._logger,
-                        logging.INFO,
-                        "Sending quick approval notification - target in whitelist",
-                        connection_id=connection_id,
-                        client_ip=client_ip,
-                        target=self._target.name,
-                    )
-                    self._append_connection_audit(
-                        "quick_approval_notification_sent",
-                        connection_id=connection_id,
-                        client_port=client_port,
-                        target=self._target.name,
-                    )
-                    # 发送快速授权通知给所有启用的通知方式
-                    self._notifier.send_quick_approval(self._target.name, client_ip, quick_approve_url)
-                    # 然后继续等待验证
-                    stage = "wait_verification"
-                    wait_start_ts = time.time()
-                    self._append_connection_audit(
-                        "verification_wait_started",
-                        connection_id=connection_id,
-                        client_port=client_port,
-                        target=self._target.name,
-                        wait_seconds=self._verification_wait_seconds,
-                    )
-                    approved, wait_reason = self._wait_for_verification_or_disconnect(
-                        client=client,
-                        event=evt,
-                        timeout_seconds=self._verification_wait_seconds,
-                    )
-                    self._append_connection_audit(
-                        "verification_wait_finished",
-                        connection_id=connection_id,
-                        client_port=client_port,
-                        target=self._target.name,
-                        approved=approved,
-                        reason=wait_reason,
-                        waited_seconds=round(time.time() - wait_start_ts, 2),
-                    )
-                    if not approved and wait_reason == "client_disconnected":
-                        self._verification.close_request(connection_id, wait_reason)
-                        self._append_connection_audit(
-                            "verification_cancelled",
-                            connection_id=connection_id,
-                            client_port=client_port,
-                            target=self._target.name,
-                            reason=wait_reason,
-                        )
-                        self._append_connection_audit(
-                            "connection_aborted",
-                            connection_id=connection_id,
-                            client_port=client_port,
-                            target=self._target.name,
-                            stage=stage,
-                            reason=wait_reason,
-                        )
-                        return
-                    if not approved:
-                        log_with_data(
-                            self._logger,
-                            logging.WARNING,
-                            "Quick approval timeout",
-                            connection_id=connection_id,
-                            client_ip=client_ip,
-                            target=self._target.name,
-                        )
-                        self._verification.close_request(connection_id, wait_reason)
-                        self._append_connection_audit(
-                            "quick_approval_timeout",
-                            connection_id=connection_id,
-                            client_port=client_port,
-                            target=self._target.name,
-                            wait_seconds=self._verification_wait_seconds,
-                            reason=wait_reason,
-                        )
-                        if self._deny_if_timeout:
-                            self._append_connection_audit(
-                                "connection_aborted",
-                                connection_id=connection_id,
-                                client_port=client_port,
-                                target=self._target.name,
-                                stage=stage,
-                                reason="quick_approval_timeout_deny",
-                            )
-                            return
-                    self._unregister_pending_verification(connection_id)
-                    pending_registered = False
-                elif self._is_recently_approved_ip(client_ip):
+            if self._security_enabled:
+                if self._is_recently_approved_ip(client_ip):
                     approved = True
-                    self._verification.approve_request(connection_id)
+                    log_with_data(
+                        self._logger,
+                        logging.INFO,
+                        "Verification bypassed by recent IP approval",
+                        connection_id=connection_id,
+                        client_ip=client_ip,
+                        target=self._target.name,
+                        reuse_seconds=self._approved_ip_reuse_seconds,
+                    )
                     self._append_connection_audit(
                         "verification_bypassed_recent_approval",
                         connection_id=connection_id,
@@ -538,9 +394,78 @@ class TargetProxy:
                         target=self._target.name,
                         reuse_seconds=self._approved_ip_reuse_seconds,
                     )
-                    self._unregister_pending_verification(connection_id)
-                    pending_registered = False
                 else:
+                    stage = "notify_delay_window"
+                    if not self._wait_for_verification_notify_window(client):
+                        self._append_connection_audit(
+                            "verification_notify_suppressed",
+                            connection_id=connection_id,
+                            client_port=client_port,
+                            target=self._target.name,
+                            reason="client_disconnected_before_notify_window",
+                            delay_seconds=round(self._verification_notify_delay_seconds, 2),
+                        )
+                        self._append_connection_audit(
+                            "connection_aborted",
+                            connection_id=connection_id,
+                            client_port=client_port,
+                            target=self._target.name,
+                            stage=stage,
+                            reason="client_disconnected_before_notify_window",
+                        )
+                        return
+
+                    stage = "create_verification"
+                    can_wait, queue_reason, replaced = self._register_pending_verification(
+                        connection_id=connection_id,
+                        client=client,
+                        client_ip=client_ip,
+                        client_port=client_port,
+                    )
+                    if not can_wait:
+                        self._append_connection_audit(
+                            "connection_rejected",
+                            connection_id=connection_id,
+                            client_port=client_port,
+                            target=self._target.name,
+                            reason=queue_reason,
+                        )
+                        return
+                    if replaced:
+                        self._append_connection_audit(
+                            "pending_replaced_same_ip",
+                            connection_id=connection_id,
+                            client_port=client_port,
+                            target=self._target.name,
+                            replaced_connection_id=str(replaced.get("connection_id", "")),
+                            replaced_client_port=int(replaced.get("client_port", 0)),
+                        )
+                    pending_registered = True
+                    token, evt, url = self._verification.create_token(
+                        {
+                            "target": self._target.name,
+                            "client_ip": client_ip,
+                            "instance_id": self._target.cloud.instance_id if self._target.cloud else "N/A",
+                        }
+                    )
+                    log_with_data(
+                        self._logger,
+                        logging.INFO,
+                        "Verification sent",
+                        connection_id=connection_id,
+                        client_ip=client_ip,
+                        token=token,
+                        verify_url=url,
+                    )
+                    self._append_connection_audit(
+                        "verification_sent",
+                        connection_id=connection_id,
+                        client_port=client_port,
+                        target=self._target.name,
+                        token=token,
+                        delay_seconds=round(self._verification_notify_delay_seconds, 2),
+                    )
+
                     stage = "wait_verification"
                     wait_start_ts = time.time()
                     self._append_connection_audit(
@@ -565,7 +490,7 @@ class TargetProxy:
                         waited_seconds=round(time.time() - wait_start_ts, 2),
                     )
                     if not approved and wait_reason == "client_disconnected":
-                        self._verification.close_request(connection_id, wait_reason)
+                        self._verification.cancel_token(token)
                         self._append_connection_audit(
                             "verification_cancelled",
                             connection_id=connection_id,
@@ -591,7 +516,6 @@ class TargetProxy:
                             client_ip=client_ip,
                             target=self._target.name,
                         )
-                        self._verification.close_request(connection_id, wait_reason)
                         self._append_connection_audit(
                             "verification_timeout",
                             connection_id=connection_id,
@@ -621,7 +545,6 @@ class TargetProxy:
             lock_ok, lock_reason = self._acquire_forwarding_slot_or_disconnect(
                 client=client,
                 timeout_seconds=self._forwarding_slot_wait_seconds,
-                is_approved=approved,
             )
             if not lock_ok:
                 log_with_data(
@@ -758,7 +681,6 @@ class TargetProxy:
         finally:
             if pending_registered:
                 self._unregister_pending_verification(connection_id)
-            self._verification.close_request(connection_id, "connection_closed")
             with suppress(OSError):
                 client.close()
             if upstream:
@@ -880,17 +802,9 @@ class TargetProxy:
         self,
         client: socket.socket,
         timeout_seconds: int,
-        is_approved: bool = False,
     ) -> tuple[bool, str]:
-        # 已放行的连接获得更长的超时或优先权
-        effective_timeout = timeout_seconds
-        if is_approved:
-            effective_timeout = max(timeout_seconds, timeout_seconds * 2)
-        
-        deadline = time.time() + max(0, effective_timeout)
+        deadline = time.time() + max(0, timeout_seconds)
         waiting_logged = False
-        # 已放行连接使用更短的select超时以获得更多的锁获取机会
-        select_timeout = 0.05 if is_approved else 0.2
 
         while time.time() < deadline:
             if self._single_session_lock.acquire(blocking=False):
@@ -903,12 +817,11 @@ class TargetProxy:
                     "Forwarding slot busy, waiting",
                     target=self._target.name,
                     wait_seconds=timeout_seconds,
-                    priority="high" if is_approved else "normal",
                 )
                 waiting_logged = True
 
             try:
-                readable, _, _ = select.select([client], [], [], select_timeout)
+                readable, _, _ = select.select([client], [], [], 0.2)
             except (OSError, ValueError):
                 log_with_data(
                     self._logger,
@@ -1422,18 +1335,17 @@ class RDPProxyApp:
     def __init__(self, cfg: AppConfig):
         self._cfg = cfg
         self._logger = logging.getLogger("rdp_proxy.app")
-        self._verification = ControlCenterService(
-            bind=cfg.server.control_http_bind,
-            port=cfg.server.control_http_port,
-            external_base_url=cfg.server.external_control_base_url,
+        self._whitelist = WhitelistStore(cfg.whitelist)
+        self._verification = VerificationService(
+            bind=cfg.server.verify_http_bind,
+            port=cfg.server.verify_http_port,
+            external_base_url=cfg.server.external_verify_base_url,
             ttl_seconds=cfg.security.token_ttl_seconds,
-            on_approved=self._handle_verification_approved,
+            on_verified=self._handle_verification_approved,
             on_action=self._handle_post_disconnect_action,
+            on_whitelist_message=self._handle_whitelist_message,
         )
-        self._notifier = Notifier(cfg.notifications)
-        self._summary_interval_seconds = max(1, int(cfg.notifications.control_summary_interval_seconds))
-        self._summary_stop_event = threading.Event()
-        self._summary_thread: threading.Thread | None = None
+        self._notifier = Notifier(cfg.notifications, verification_message_ttl_seconds=cfg.security.token_ttl_seconds)
         self._targets: list[TargetProxy] = [
             TargetProxy(
                 bind_host=cfg.server.bind,
@@ -1450,6 +1362,7 @@ class RDPProxyApp:
                 approved_ip_reuse_seconds=cfg.security.approved_ip_reuse_seconds,
                 per_ip_connection_rate_window_seconds=cfg.security.per_ip_connection_rate_window_seconds,
                 per_ip_connection_rate_limit=cfg.security.per_ip_connection_rate_limit,
+                whitelist=self._whitelist,
             )
             for t in cfg.targets
         ]
@@ -1478,37 +1391,27 @@ class RDPProxyApp:
         )
 
     def _handle_verification_approved(self, token: str, meta: dict) -> None:
+        self._notifier.on_verification_approved(token)
         log_with_data(
             self._logger,
             logging.INFO,
-            "Request approval callback processed",
+            "Verification callback processed",
             token=token,
             target=meta.get("target", "unknown"),
             client_ip=meta.get("client_ip", "unknown"),
         )
 
-    def _summary_loop(self) -> None:
-        while not self._summary_stop_event.wait(self._summary_interval_seconds):
-            snapshot = self._verification.get_dashboard_snapshot(view="recent", window_seconds=self._summary_interval_seconds)
-            recent_totals = snapshot.get("recent_totals", {})
-            self._notifier.send_control_summary(
-                window_seconds=self._summary_interval_seconds,
-                requested_count=int(recent_totals.get("requested", 0)),
-                approved_count=int(recent_totals.get("approved", 0)),
-                summary_url=self._verification.recent_url(self._summary_interval_seconds),
-            )
+    def _handle_whitelist_message(self, text: str) -> tuple[bool, str]:
+        result = self._whitelist.ingest_text(text)
+        return result.allowed, result.message
 
     def start(self) -> None:
         self._verification.start()
         for target in self._targets:
             target.start()
-        self._notifier.send_control_startup(self._verification.control_url)
-        self._summary_thread = threading.Thread(target=self._summary_loop, name="control-summary", daemon=True)
-        self._summary_thread.start()
         log_with_data(self._logger, logging.INFO, "RDP proxy app started", target_count=len(self._targets))
 
     def stop(self) -> None:
-        self._summary_stop_event.set()
         for target in self._targets:
             target.stop()
         self._verification.stop()
