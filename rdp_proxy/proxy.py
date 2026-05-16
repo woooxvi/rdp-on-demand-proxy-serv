@@ -1422,7 +1422,7 @@ class RDPProxyApp:
             logging.INFO,
             "Whitelist message processed",
             accepted=result.allowed,
-            message=result.message,
+            result_message=result.message,
             normalized_ip=result.normalized_ip,
         )
         return result.allowed, result.message

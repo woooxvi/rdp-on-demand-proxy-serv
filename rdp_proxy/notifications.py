@@ -459,7 +459,13 @@ class Notifier:
             try:
                 self._poll_telegram_once()
             except Exception as exc:
-                log_with_data(self._logger, logging.ERROR, "Telegram inbound polling failed", error=str(exc))
+                log_with_data(
+                    self._logger,
+                    logging.ERROR,
+                    "Telegram inbound polling failed",
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
                 self._telegram_poll_stop.wait(5)
 
     def _poll_telegram_once(self) -> None:
