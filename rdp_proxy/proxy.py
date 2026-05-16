@@ -1458,7 +1458,7 @@ class RDPProxyApp:
             return True, (
                 "可用命令:\n"
                 "/control - 获取白名单管理页链接\n"
-                "/quick-approve [n] - 获取最近待授权链接(默认1条)\n"
+                "/quick_approve [n] - 获取最近待授权链接(默认1条)\n"
                 "/approve [n] - 同 /quick-approve\n"
                 "/blacklist - 获取控制页面进行黑名单操作\n"
                 "/action [target] [keep|shutdown] - 生成一次性动作链接\n"
@@ -1468,7 +1468,7 @@ class RDPProxyApp:
         if command == "/control":
             return True, f"控制页面: {self._verification.whitelist_url}"
 
-        if command in {"/quick-approve", "/approve"}:
+        if command in {"/quick-approve", "/quick_approve", "/approve"}:
             limit = 1
             if len(parts) >= 2:
                 with suppress(ValueError):

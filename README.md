@@ -1,6 +1,6 @@
 # RDP On-Demand Proxy
 
-当前版本: v0.2.2
+当前版本: v0.2.6
 
 轻量级 Python TCP 代理，面向 Windows RDP 按需启停场景。内置腾讯云 CVM、阿里云 ECS、Telegram/钉钉/企业微信通知，支持 Docker 部署。
 

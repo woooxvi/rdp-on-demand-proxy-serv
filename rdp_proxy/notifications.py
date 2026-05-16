@@ -427,6 +427,27 @@ class Notifier:
                 return True, json.loads(raw.decode("utf-8"))
             except (ValueError, UnicodeDecodeError):
                 return True, None
+        except urllib.error.HTTPError as exc:
+            response_text = ""
+            try:
+                response_text = exc.read().decode("utf-8", errors="replace")
+            except OSError:
+                response_text = ""
+            log_with_data(
+                self._logger,
+                logging.ERROR,
+                "Notification request failed",
+                error=str(exc),
+                status_code=int(getattr(exc, "code", 0) or 0),
+                response=response_text,
+                url=url,
+            )
+            if response_text:
+                try:
+                    return False, json.loads(response_text)
+                except (ValueError, UnicodeDecodeError):
+                    return False, {"raw": response_text}
+            return False, None
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             log_with_data(self._logger, logging.ERROR, "Notification request failed", error=str(exc), url=url)
             return False, None
@@ -464,7 +485,7 @@ class Notifier:
         commands = [
             {"command": "control", "description": "获取控制/管理页面链接"},
             {"command": "action", "description": "获取动作链接（keep/shutdown）"},
-            {"command": "quick-approve", "description": "获取最近待授权链接"},
+            {"command": "quick_approve", "description": "获取最近待授权链接"},
             {"command": "approve", "description": "同 quick-approve"},
             {"command": "blacklist", "description": "进入黑名单管理入口"},
             {"command": "whitelist", "description": "进入白名单管理入口"},

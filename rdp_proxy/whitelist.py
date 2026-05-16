@@ -37,7 +37,7 @@ class WhitelistStore:
         self._entries_by_cipher: dict[str, dict[str, object]] = {}
         self._rejected_by_ip: dict[str, dict[str, object]] = {}
         self._last_loaded_mtime_ns: int | None = None
-        self._load_from_disk()
+        self._load_from_storage()
 
     def _normalize_mode(self, value: str) -> str:
         mode = value.strip().lower()
@@ -230,28 +230,36 @@ class WhitelistStore:
         }
         return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
 
-    def _load_from_disk(self) -> None:
+    def _load_from_storage(self) -> None:
         with self._lock:
-            if not self._path.exists():
-                self._cipher_ips = set()
-                self._last_loaded_mtime_ns = None
-                return
-
             try:
-                text = self._path.read_text(encoding="utf-8")
+                text = self._read_storage_payload_locked()
                 payload = json.loads(text) if text.strip() else {}
                 self._entries_by_cipher, self._rejected_by_ip = self._decode_payload(payload)
-                self._last_loaded_mtime_ns = self._path.stat().st_mtime_ns
+                if self._mode == "filesystem" and self._path.exists():
+                    self._last_loaded_mtime_ns = self._path.stat().st_mtime_ns
+                else:
+                    self._last_loaded_mtime_ns = None
             except Exception as exc:
                 log_with_data(
                     self._logger,
                     logging.WARNING,
-                    "Whitelist file load failed",
+                    "Whitelist load failed",
                     path=str(self._path),
+                    storage=self._mode,
                     error=str(exc),
                 )
 
+    def _read_storage_payload_locked(self) -> str:
+        if self._mode == "k8":
+            return self._read_k8_secret()
+        if not self._path.exists():
+            return ""
+        return self._path.read_text(encoding="utf-8")
+
     def _refresh_if_needed_locked(self) -> None:
+        if self._mode != "filesystem":
+            return
         try:
             mtime_ns = self._path.stat().st_mtime_ns
         except OSError:
@@ -486,6 +494,11 @@ class WhitelistStore:
         return os.environ.get("KUBERNETES_NAMESPACE", "default")
 
     def _write_k8_secret(self, payload: str) -> None:
+        api, namespace = self._get_k8_secret_api()
+        encoded_payload = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+        api.patch_namespaced_secret(self._secret_name, namespace, {"data": {self._secret_key: encoded_payload}})
+
+    def _get_k8_secret_api(self):
         try:
             from kubernetes import client, config as kube_config  # type: ignore[import-not-found]
         except ImportError as exc:
@@ -502,6 +515,13 @@ class WhitelistStore:
         except Exception:
             kube_config.load_kube_config()
 
-        api = client.CoreV1Api()
-        encoded_payload = base64.b64encode(payload.encode("utf-8")).decode("ascii")
-        api.patch_namespaced_secret(self._secret_name, namespace, {"data": {self._secret_key: encoded_payload}})
+        return client.CoreV1Api(), namespace
+
+    def _read_k8_secret(self) -> str:
+        api, namespace = self._get_k8_secret_api()
+        secret = api.read_namespaced_secret(self._secret_name, namespace)
+        raw_data = getattr(secret, "data", None) or {}
+        encoded_payload = str(raw_data.get(self._secret_key, "")).strip()
+        if not encoded_payload:
+            return ""
+        return base64.b64decode(encoded_payload).decode("utf-8")
