@@ -57,7 +57,9 @@ class Notifier:
     def start(self) -> None:
         if not self._cfg.telegram.enabled:
             return
-        if self._telegram_inbound_handler is None:
+        self._ensure_telegram_menu()
+        if self._telegram_inbound_handler is None and self._telegram_command_handler is None:
+            log_with_data(self._logger, logging.INFO, "Telegram inbound handlers are disabled")
             return
         if self._telegram_poll_thread is not None and self._telegram_poll_thread.is_alive():
             return
@@ -453,6 +455,40 @@ class Notifier:
             if isinstance(result, dict) and isinstance(result.get("message_id"), int):
                 message_id = result["message_id"]
         return True, message_id
+
+    def _ensure_telegram_menu(self) -> None:
+        token = self._cfg.telegram.bot_token
+        if not token:
+            return
+
+        commands = [
+            {"command": "control", "description": "获取控制/管理页面链接"},
+            {"command": "action", "description": "获取动作链接（keep/shutdown）"},
+            {"command": "quick-approve", "description": "获取最近待授权链接"},
+            {"command": "approve", "description": "同 quick-approve"},
+            {"command": "blacklist", "description": "进入黑名单管理入口"},
+            {"command": "whitelist", "description": "进入白名单管理入口"},
+            {"command": "help", "description": "查看可用命令"},
+        ]
+        url = f"https://api.telegram.org/bot{token}/setMyCommands"
+        payload = {"commands": commands}
+        ok, response = self._post_json_with_response(url, payload, insecure_skip_verify=self._cfg.telegram.insecure_skip_verify)
+        if ok:
+            log_with_data(
+                self._logger,
+                logging.INFO,
+                "Telegram command menu configured",
+                command_count=len(commands),
+            )
+            return
+
+        log_with_data(
+            self._logger,
+            logging.WARNING,
+            "Telegram command menu configuration failed",
+            command_count=len(commands),
+            response=str(response),
+        )
 
     def _telegram_poll_loop(self) -> None:
         while not self._telegram_poll_stop.is_set():

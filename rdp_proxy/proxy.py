@@ -452,6 +452,7 @@ class TargetProxy:
                             "instance_id": self._target.cloud.instance_id if self._target.cloud else "N/A",
                         }
                     )
+                    self._notifier.send_verification(client_ip, self._target, url, token=token)
                     log_with_data(
                         self._logger,
                         logging.INFO,
@@ -1451,19 +1452,23 @@ class RDPProxyApp:
         if not parts:
             return False, "empty command"
 
-        command = parts[0].lower()
+        raw_command = parts[0].lower()
+        command = raw_command.split("@", 1)[0]
         if command in {"/help", "/start"}:
             return True, (
                 "可用命令:\n"
                 "/control - 获取白名单管理页链接\n"
                 "/quick-approve [n] - 获取最近待授权链接(默认1条)\n"
-                "/action <target> <keep|shutdown> - 生成一次性动作链接"
+                "/approve [n] - 同 /quick-approve\n"
+                "/blacklist - 获取控制页面进行黑名单操作\n"
+                "/action [target] [keep|shutdown] - 生成一次性动作链接\n"
+                "/whitelist - 获取白名单管理页链接"
             )
 
         if command == "/control":
             return True, f"控制页面: {self._verification.whitelist_url}"
 
-        if command == "/quick-approve":
+        if command in {"/quick-approve", "/approve"}:
             limit = 1
             if len(parts) >= 2:
                 with suppress(ValueError):
@@ -1481,7 +1486,13 @@ class RDPProxyApp:
 
         if command == "/action":
             if len(parts) < 3:
-                return False, "用法: /action <target> <keep|shutdown>"
+                lines = ["动作链接（默认展示全部 target）:"]
+                for target_name in sorted(self._target_by_name.keys()):
+                    keep_url, shutdown_url = self._verification.create_action_links(target_name)
+                    lines.append(f"- {target_name} keep: {keep_url}")
+                    lines.append(f"- {target_name} shutdown: {shutdown_url}")
+                return True, "\n".join(lines)
+
             target_name = parts[1]
             mode = parts[2].lower()
             target = self._target_by_name.get(target_name)
@@ -1494,6 +1505,9 @@ class RDPProxyApp:
             if mode in {"shutdown", "shutdown_on_idle", "stop"}:
                 return True, f"关机策略链接: {shutdown_url}"
             return False, "动作参数仅支持 keep 或 shutdown"
+
+        if command == "/blacklist":
+            return True, f"请在控制页面操作黑名单: {self._verification.whitelist_url}"
 
         if command == "/whitelist":
             return True, f"白名单管理页: {self._verification.whitelist_url}"
