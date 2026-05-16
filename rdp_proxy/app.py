@@ -8,6 +8,7 @@ import threading
 import time
 from datetime import datetime
 
+from rdp_proxy import __version__
 from rdp_proxy.cloud.factory import create_provider
 from rdp_proxy.config import load_config
 from rdp_proxy.logging_utils import set_access_log_details, setup_logging
@@ -215,6 +216,7 @@ def _validate_ports(cfg) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="RDP On-Demand Proxy")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--config", default="config.yml", help="Path to config JSON/YAML")
     parser.add_argument("--log-level", default="INFO", help="Log level")
     parser.add_argument(

@@ -13,6 +13,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime
+from typing import Callable
 
 try:
     import pytz  # type: ignore[import-not-found]
@@ -29,18 +30,47 @@ from rdp_proxy.logging_utils import log_with_data
 
 
 class Notifier:
-    def __init__(self, config: NotificationsConfig, verification_message_ttl_seconds: int = 300):
+    def __init__(
+        self,
+        config: NotificationsConfig,
+        verification_message_ttl_seconds: int = 300,
+        inbound_text_handler: Callable[[str], tuple[bool, str]] | None = None,
+    ):
         self._cfg = config
         self._verification_message_ttl_seconds = max(1, int(verification_message_ttl_seconds))
         self._logger = logging.getLogger("rdp_proxy.notifications")
         self._telegram_verification_messages: dict[str, list[int]] = {}
         self._telegram_disconnect_messages: dict[str, list[int]] = {}
+        self._telegram_inbound_handler = inbound_text_handler
+        self._telegram_poll_thread: threading.Thread | None = None
+        self._telegram_poll_stop = threading.Event()
+        self._telegram_update_offset: int | None = None
         self._geoip_cache: dict[str, tuple[float, str]] = {}
         self._geo_city_reader = None
         self._geo_asn_reader = None
         self._lock = threading.Lock()
         self._timezone_obj = self._init_timezone()
         self._init_geoip_readers()
+
+    def start(self) -> None:
+        if not self._cfg.telegram.enabled:
+            return
+        if self._telegram_inbound_handler is None:
+            return
+        if self._telegram_poll_thread is not None and self._telegram_poll_thread.is_alive():
+            return
+
+        self._telegram_poll_stop.clear()
+        self._telegram_poll_thread = threading.Thread(
+            target=self._telegram_poll_loop,
+            name="telegram-inbound-poll",
+            daemon=True,
+        )
+        self._telegram_poll_thread.start()
+        log_with_data(self._logger, logging.INFO, "Telegram inbound polling started")
+
+    def stop(self) -> None:
+        self._telegram_poll_stop.set()
 
     def _init_geoip_readers(self) -> None:
         if not self._cfg.geoip.enabled:
@@ -350,6 +380,26 @@ class Notifier:
         ok, _ = self._post_json_with_response(url, payload, insecure_skip_verify=insecure_skip_verify)
         return ok
 
+    def _get_json_with_response(
+        self,
+        url: str,
+        insecure_skip_verify: bool = False,
+    ) -> tuple[bool, dict | None]:
+        req = urllib.request.Request(url, method="GET")
+        try:
+            context = ssl._create_unverified_context() if insecure_skip_verify else None
+            with urllib.request.urlopen(req, timeout=25, context=context) as resp:
+                raw = resp.read()
+            if not raw:
+                return True, None
+            try:
+                return True, json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return False, None
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            log_with_data(self._logger, logging.ERROR, "Notification request failed", error=str(exc), url=url)
+            return False, None
+
     def _post_json_with_response(
         self,
         url: str,
@@ -401,6 +451,94 @@ class Notifier:
             if isinstance(result, dict) and isinstance(result.get("message_id"), int):
                 message_id = result["message_id"]
         return True, message_id
+
+    def _telegram_poll_loop(self) -> None:
+        while not self._telegram_poll_stop.is_set():
+            try:
+                self._poll_telegram_once()
+            except Exception as exc:
+                log_with_data(self._logger, logging.ERROR, "Telegram inbound polling failed", error=str(exc))
+                self._telegram_poll_stop.wait(5)
+
+    def _poll_telegram_once(self) -> None:
+        token = self._cfg.telegram.bot_token
+        if not token:
+            self._telegram_poll_stop.wait(5)
+            return
+
+        params = {
+            "timeout": 20,
+            "allowed_updates": json.dumps(["message"]),
+        }
+        if self._telegram_update_offset is not None:
+            params["offset"] = str(self._telegram_update_offset)
+        query = urllib.parse.urlencode(params)
+        url = f"https://api.telegram.org/bot{token}/getUpdates?{query}"
+        ok, response = self._get_json_with_response(url, insecure_skip_verify=self._cfg.telegram.insecure_skip_verify)
+        if not ok:
+            self._telegram_poll_stop.wait(5)
+            return
+        if not isinstance(response, dict) or not response.get("ok"):
+            self._telegram_poll_stop.wait(5)
+            return
+
+        results = response.get("result")
+        if not isinstance(results, list):
+            return
+
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            update_id = item.get("update_id")
+            if isinstance(update_id, int):
+                self._telegram_update_offset = update_id + 1
+            message = item.get("message")
+            if not isinstance(message, dict):
+                continue
+            self._handle_telegram_message(message)
+
+    def _handle_telegram_message(self, message: dict) -> None:
+        if self._telegram_inbound_handler is None:
+            return
+
+        chat = message.get("chat")
+        if not isinstance(chat, dict):
+            return
+        chat_id = str(chat.get("id", "")).strip()
+        if chat_id != str(self._cfg.telegram.chat_id).strip():
+            return
+
+        text = str(message.get("text", "")).strip()
+        if not text:
+            return
+
+        ok, detail = self._telegram_inbound_handler(text)
+        log_with_data(
+            self._logger,
+            logging.INFO,
+            "Telegram inbound message processed",
+            accepted=ok,
+            detail=detail,
+            text=text,
+        )
+        reply_text = f"白名单处理成功: {detail}" if ok else f"白名单处理失败: {detail}"
+        self._send_telegram_reply(chat_id, reply_text, reply_to_message_id=message.get("message_id"))
+
+    def _send_telegram_reply(self, chat_id: str, text: str, reply_to_message_id: object = None) -> bool:
+        token = self._cfg.telegram.bot_token
+        if not token or not chat_id:
+            return False
+
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload: dict[str, object] = {
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": True,
+        }
+        if isinstance(reply_to_message_id, int):
+            payload["reply_to_message_id"] = reply_to_message_id
+        ok, _ = self._post_json_with_response(url, payload, insecure_skip_verify=self._cfg.telegram.insecure_skip_verify)
+        return ok
 
     def _delete_telegram_message(self, message_id: int) -> bool:
         token = self._cfg.telegram.bot_token

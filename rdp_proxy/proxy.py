@@ -8,6 +8,7 @@ import time
 from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 from uuid import uuid4
 
 from rdp_proxy.cloud.base import CloudProvider
@@ -37,6 +38,7 @@ class TargetProxy:
         per_ip_connection_rate_window_seconds: int,
         per_ip_connection_rate_limit: int,
         whitelist: WhitelistStore,
+        on_whitelist_rejected: Callable[[str, str], None],
     ):
         self._bind_host = bind_host
         self._target = target
@@ -48,6 +50,7 @@ class TargetProxy:
         self._deny_if_timeout = deny_if_timeout
         self._max_pending_connections = max_pending_connections
         self._whitelist = whitelist
+        self._on_whitelist_rejected = on_whitelist_rejected
         self._provider: CloudProvider | None = (
             create_provider(target.cloud) if target.cloud_control_enabled and target.cloud is not None else None
         )
@@ -357,6 +360,7 @@ class TargetProxy:
 
             stage = "whitelist_check"
             if not self._whitelist.contains(client_ip):
+                self._on_whitelist_rejected(client_ip, self._target.name)
                 log_with_data(
                     self._logger,
                     logging.INFO,
@@ -1344,8 +1348,16 @@ class RDPProxyApp:
             on_verified=self._handle_verification_approved,
             on_action=self._handle_post_disconnect_action,
             on_whitelist_message=self._handle_whitelist_message,
+            add_whitelist_ip=self._add_whitelist_ip,
+            delete_whitelist_entry=self._delete_whitelist_entry,
+            list_whitelist_entries=self._list_whitelist_entries,
+            list_recent_rejections=self._list_recent_rejections,
         )
-        self._notifier = Notifier(cfg.notifications, verification_message_ttl_seconds=cfg.security.token_ttl_seconds)
+        self._notifier = Notifier(
+            cfg.notifications,
+            verification_message_ttl_seconds=cfg.security.token_ttl_seconds,
+            inbound_text_handler=self._handle_whitelist_message,
+        )
         self._targets: list[TargetProxy] = [
             TargetProxy(
                 bind_host=cfg.server.bind,
@@ -1363,6 +1375,7 @@ class RDPProxyApp:
                 per_ip_connection_rate_window_seconds=cfg.security.per_ip_connection_rate_window_seconds,
                 per_ip_connection_rate_limit=cfg.security.per_ip_connection_rate_limit,
                 whitelist=self._whitelist,
+                on_whitelist_rejected=self._record_whitelist_rejection,
             )
             for t in cfg.targets
         ]
@@ -1403,15 +1416,43 @@ class RDPProxyApp:
 
     def _handle_whitelist_message(self, text: str) -> tuple[bool, str]:
         result = self._whitelist.ingest_text(text)
+        log_with_data(
+            self._logger,
+            logging.INFO,
+            "Whitelist message processed",
+            accepted=result.allowed,
+            message=result.message,
+            normalized_ip=result.normalized_ip,
+        )
         return result.allowed, result.message
+
+    def _add_whitelist_ip(self, client_ip: str, source: str) -> tuple[bool, str]:
+        result = self._whitelist.add_ip(client_ip, source=source)
+        return result.allowed, result.message if not result.normalized_ip else f"{result.normalized_ip} ({result.message})"
+
+    def _delete_whitelist_entry(self, identifier: str) -> tuple[bool, str]:
+        result = self._whitelist.delete_entry(identifier)
+        return result.allowed, result.message if not result.normalized_ip else f"{result.normalized_ip} ({result.message})"
+
+    def _list_whitelist_entries(self) -> list[dict[str, object]]:
+        return self._whitelist.list_entries()
+
+    def _list_recent_rejections(self) -> list[dict[str, object]]:
+        return self._whitelist.list_recent_rejections()
+
+    def _record_whitelist_rejection(self, client_ip: str, target_name: str) -> None:
+        geo_text = self._notifier.resolve_geo_text(client_ip)
+        self._whitelist.record_rejected_ip(client_ip, geo_text=geo_text, target_name=target_name)
 
     def start(self) -> None:
         self._verification.start()
+        self._notifier.start()
         for target in self._targets:
             target.start()
         log_with_data(self._logger, logging.INFO, "RDP proxy app started", target_count=len(self._targets))
 
     def stop(self) -> None:
+        self._notifier.stop()
         for target in self._targets:
             target.stop()
         self._verification.stop()

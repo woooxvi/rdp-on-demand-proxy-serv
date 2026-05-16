@@ -1,5 +1,7 @@
 # RDP On-Demand Proxy
 
+当前版本: v0.2.2
+
 轻量级 Python TCP 代理，面向 Windows RDP 按需启停场景。内置腾讯云 CVM、阿里云 ECS、Telegram/钉钉/企业微信通知，支持 Docker 部署。
 
 ## 主要能力
@@ -13,6 +15,8 @@
 - 结构化 JSON 日志，记录连接、状态变化、验证、转发、关机
 - 单目标单会话并发控制（多余连接拒绝）
 - 白名单持久化到 `list.json`，支持文件模式和 K8 Secret 模式
+- Telegram 机器人入站消息可直接写入白名单，并返回处理结果
+- 验证 HTTP 服务内置白名单管理页，可新增、删除、查看最近拒绝来源并一键放行
 
 ## 项目结构
 
@@ -67,6 +71,8 @@ python run.py --config config.yml
 
 白名单文件默认写到 `/list.json`。文件内容保存的是 IP 的单向摘要，不是明文 IP。
 
+从 v0.2.2 开始，白名单条目会以可逆密文方式存储，便于在管理页中列出和删除；如果未显式配置 `whitelist.secret`，默认复用 Telegram `bot_token` 作为加密密钥。
+
 如果你要从 IM 里新增白名单 IP，只需要把收到的纯 IP 文本转发到本服务的 `POST /whitelist`：
 
 ```bash
@@ -81,7 +87,16 @@ curl -X POST http://YOUR_PROXY_PUBLIC_IP:8080/whitelist \
 { "text": "2001:db8::10" }
 ```
 
+如果启用了 Telegram，并且消息来自配置中的 `chat_id`，直接在机器人对话中发送纯 IP 文本也会自动加入白名单，机器人会原消息回复处理结果，控制台也会打印处理日志。
+
 K8 模式下，程序会通过 Kubernetes API 更新挂载的 Secret，前提是 Pod 对应 ServiceAccount 具备写权限。
+
+浏览器访问 `http://YOUR_PROXY_PUBLIC_IP:8080/whitelist` 可进入白名单管理页，支持：
+
+- 手工输入 IP 新增白名单
+- 读取当前访问端 IP 并一键放行
+- 查看现有白名单并删除条目
+- 查看最近因未命中白名单而被拒绝的来源 IP、GEO、目标和最近请求时间，并一键放行
 
 ## Docker 部署
 
@@ -156,6 +171,7 @@ sudo systemctl status rdp-proxy
 - `security.per_ip_connection_rate_limit`: 同源 IP 每个窗口允许的新建连接数（默认 4）。超出后连接会等待到下一个窗口再继续。
 - `whitelist.path`: 白名单文件路径，默认 `/list.json`。
 - `whitelist.storage`: `filesystem` 表示直接写文件，`k8` 表示通过 Kubernetes Secret 更新挂载内容。
+- `whitelist.secret`: 白名单密文加密密钥；留空时默认复用 `notifications.telegram.bot_token`。
 - `whitelist.k8_secret_name`: K8 模式下要更新的 Secret 名称。
 - `whitelist.k8_secret_namespace`: K8 模式下 Secret 所在命名空间，留空时自动读取当前 Pod 命名空间。
 - `whitelist.k8_secret_key`: K8 模式下写入 Secret 的 key，默认 `list.json`。
@@ -173,8 +189,9 @@ sudo systemctl status rdp-proxy
 - 断开提醒采用 30 秒观察窗口：若断开后 30 秒内出现新连接，会抑制上一条断开提醒，减少“密码阶段二次建连”噪声。
 - 通知中的来源 IP 默认脱敏为“IP 尾号”。
 - 连接访问控制先检查白名单，`list.json` 中没有的 IP 会直接拒绝，不再进入 IM 授权流程。
-- 白名单内容使用 IP 的单向摘要存储，配置文件中不会落明文 IP。
+- 白名单内容使用密文存储，配置文件中不会落明文 IP。
 - 收到纯 IP 文本后，会写入白名单并立即生效；可以通过入站消息桥接到 `POST /whitelist`。
+- Telegram 入站轮询只处理配置 `chat_id` 对应会话中的文本消息，避免其他聊天源误写入白名单。
 - 可选开启 `notifications.geoip.enabled` 获取来源城市 + ASN 信息，推荐离线模式：`notifications.geoip.mode=offline`。
 - 离线模式需要本地数据库文件：`notifications.geoip.city_db_path`（GeoLite2-City.mmdb）与 `notifications.geoip.asn_db_path`（GeoLite2-ASN.mmdb）。
 - 兼容在线模式：`notifications.geoip.mode=online` 时仍支持 `endpoint_templates` 回退查询。

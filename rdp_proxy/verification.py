@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 from uuid import uuid4
 
 from rdp_proxy.logging_utils import log_with_data
@@ -46,6 +46,10 @@ class VerificationService:
         on_verified: Callable[[str, dict], None] | None = None,
         on_action: Callable[[str, str], None] | None = None,
         on_whitelist_message: Callable[[str], tuple[bool, str]] | None = None,
+        add_whitelist_ip: Callable[[str, str], tuple[bool, str]] | None = None,
+        delete_whitelist_entry: Callable[[str], tuple[bool, str]] | None = None,
+        list_whitelist_entries: Callable[[], list[dict[str, object]]] | None = None,
+        list_recent_rejections: Callable[[], list[dict[str, object]]] | None = None,
     ):
         self._bind = bind
         self._port = port
@@ -58,6 +62,10 @@ class VerificationService:
         self._on_verified = on_verified
         self._on_action = on_action
         self._on_whitelist_message = on_whitelist_message
+        self._add_whitelist_ip = add_whitelist_ip
+        self._delete_whitelist_entry = delete_whitelist_entry
+        self._list_whitelist_entries = list_whitelist_entries
+        self._list_recent_rejections = list_recent_rejections
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -179,7 +187,7 @@ class VerificationService:
                     self._handle_action(parsed)
                     return
                 if parsed.path == "/whitelist":
-                    self._handle_whitelist(parsed)
+                    self._render_whitelist_page(parsed)
                     return
                 if parsed.path != "/verify":
                     self._send_html(HTTPStatus.NOT_FOUND, "Not Found")
@@ -262,9 +270,13 @@ class VerificationService:
                 if parsed.path != "/whitelist":
                     self._send_html(HTTPStatus.NOT_FOUND, "Not Found")
                     return
-                self._handle_whitelist(parsed, allow_body=True)
+                content_type = self.headers.get("Content-Type", "")
+                if "application/x-www-form-urlencoded" in content_type:
+                    self._handle_whitelist_form()
+                    return
+                self._handle_whitelist_api(parsed, allow_body=True)
 
-            def _handle_whitelist(self, parsed, allow_body: bool = False) -> None:
+            def _handle_whitelist_api(self, parsed, allow_body: bool = False) -> None:
                 if not service._on_whitelist_message:
                     self._send_html(HTTPStatus.NOT_IMPLEMENTED, "Whitelist ingestion is disabled")
                     return
@@ -318,6 +330,192 @@ class VerificationService:
                     self._send_html(HTTPStatus.OK, f"Whitelist updated: {html.escape(detail)}")
                     return
                 self._send_html(HTTPStatus.BAD_REQUEST, html.escape(detail))
+
+            def _handle_whitelist_form(self) -> None:
+                length_text = self.headers.get("Content-Length", "0")
+                try:
+                    content_length = max(0, int(length_text))
+                except ValueError:
+                    content_length = 0
+                raw_body = self.rfile.read(content_length).decode("utf-8", errors="replace") if content_length else ""
+                form = parse_qs(raw_body, keep_blank_values=True)
+                action = form.get("action", [""])[0].strip()
+
+                ok = False
+                detail = "unknown action"
+                if action == "add_ip" and service._add_whitelist_ip is not None:
+                    candidate = form.get("ip", [""])[0].strip()
+                    ok, detail = service._add_whitelist_ip(candidate, "http-manual")
+                elif action == "allow_current" and service._add_whitelist_ip is not None:
+                    ok, detail = service._add_whitelist_ip(self._resolve_request_ip(), "http-visitor")
+                elif action == "allow_rejected" and service._add_whitelist_ip is not None:
+                    candidate = form.get("rejected_ip", [""])[0].strip()
+                    ok, detail = service._add_whitelist_ip(candidate, "http-rejected")
+                elif action == "delete_entry" and service._delete_whitelist_entry is not None:
+                    identifier = form.get("entry_id", [""])[0].strip()
+                    ok, detail = service._delete_whitelist_entry(identifier)
+
+                self._redirect_whitelist(detail, ok)
+
+            def _render_whitelist_page(self, parsed) -> None:
+                visitor_ip = self._resolve_request_ip()
+                query = parse_qs(parsed.query)
+                flash_message = query.get("message", [""])[0]
+                flash_level = query.get("level", [""])[0]
+                whitelist_entries = service._list_whitelist_entries() if service._list_whitelist_entries else []
+                rejected_entries = service._list_recent_rejections() if service._list_recent_rejections else []
+
+                flash_html = ""
+                if flash_message:
+                    css_class = "flash flash-ok" if flash_level == "ok" else "flash flash-error"
+                    flash_html = f"<div class='{css_class}'>{html.escape(flash_message)}</div>"
+
+                whitelist_rows: list[str] = []
+                for entry in whitelist_entries:
+                    ip_text = str(entry.get("ip", "")).strip() or "<legacy>"
+                    source = str(entry.get("source", "")).strip() or "-"
+                    added_at = str(entry.get("added_at_text", "-")).strip() or "-"
+                    entry_id = str(entry.get("cipher", "")).strip()
+                    legacy = bool(entry.get("legacy", False))
+                    delete_label = "删除"
+                    legacy_text = " <span class='legacy'>(legacy)</span>" if legacy else ""
+                    whitelist_rows.append(
+                        "<tr>"
+                        f"<td>{html.escape(ip_text)}{legacy_text}</td>"
+                        f"<td>{html.escape(source)}</td>"
+                        f"<td>{html.escape(added_at)}</td>"
+                        "<td>"
+                        "<form method='post' class='inline-form'>"
+                        "<input type='hidden' name='action' value='delete_entry'>"
+                        f"<input type='hidden' name='entry_id' value='{html.escape(entry_id)}'>"
+                        f"<button type='submit'>{delete_label}</button>"
+                        "</form>"
+                        "</td>"
+                        "</tr>"
+                    )
+
+                if not whitelist_rows:
+                    whitelist_rows.append("<tr><td colspan='4' class='empty'>白名单为空</td></tr>")
+
+                rejected_rows: list[str] = []
+                for item in rejected_entries:
+                    ip_text = str(item.get("ip", "")).strip()
+                    geo = str(item.get("geo", "")).strip() or "-"
+                    target = str(item.get("target", "")).strip() or "-"
+                    count = str(item.get("count", 0))
+                    last_seen = str(item.get("last_seen_at_text", "-")).strip() or "-"
+                    rejected_rows.append(
+                        "<tr>"
+                        f"<td>{html.escape(ip_text)}</td>"
+                        f"<td>{html.escape(geo)}</td>"
+                        f"<td>{html.escape(target)}</td>"
+                        f"<td>{html.escape(last_seen)}</td>"
+                        f"<td>{html.escape(count)}</td>"
+                        "<td>"
+                        "<form method='post' class='inline-form'>"
+                        "<input type='hidden' name='action' value='allow_rejected'>"
+                        f"<input type='hidden' name='rejected_ip' value='{html.escape(ip_text)}'>"
+                        "<button type='submit'>一键放行</button>"
+                        "</form>"
+                        "</td>"
+                        "</tr>"
+                    )
+
+                if not rejected_rows:
+                    rejected_rows.append("<tr><td colspan='6' class='empty'>暂无最近拒绝记录</td></tr>")
+
+                body = f"""
+<html>
+<head>
+    <meta charset='utf-8'>
+    <title>Whitelist Manager</title>
+    <style>
+        body {{ font-family: 'Segoe UI', sans-serif; margin: 24px; color: #1f2937; background: #f4f6f8; }}
+        h1, h2 {{ margin-bottom: 12px; }}
+        .grid {{ display: grid; grid-template-columns: 1fr; gap: 20px; }}
+        .card {{ background: #fff; border-radius: 12px; padding: 20px; box-shadow: 0 10px 30px rgba(15, 23, 42, 0.08); }}
+        .flash {{ padding: 12px 14px; border-radius: 8px; margin-bottom: 16px; }}
+        .flash-ok {{ background: #dcfce7; color: #166534; }}
+        .flash-error {{ background: #fee2e2; color: #991b1b; }}
+        .toolbar {{ display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 12px; }}
+        .visitor {{ font-weight: 600; }}
+        table {{ width: 100%; border-collapse: collapse; }}
+        th, td {{ text-align: left; padding: 10px 8px; border-bottom: 1px solid #e5e7eb; vertical-align: top; }}
+        th {{ color: #475569; font-size: 13px; }}
+        input[type='text'] {{ min-width: 280px; padding: 10px 12px; border: 1px solid #cbd5e1; border-radius: 8px; }}
+        button {{ padding: 9px 14px; border: 0; border-radius: 8px; background: #0f172a; color: white; cursor: pointer; }}
+        button:hover {{ background: #1e293b; }}
+        .inline-form {{ display: inline; }}
+        .empty {{ color: #64748b; }}
+        .legacy {{ color: #b45309; font-size: 12px; }}
+    </style>
+</head>
+<body>
+    <div class='grid'>
+        <div class='card'>
+            <h1>白名单管理</h1>
+            {flash_html}
+            <div class='toolbar'>
+                <span class='visitor'>当前访问端 IP: {html.escape(visitor_ip)}</span>
+                <form method='post' class='inline-form'>
+                    <input type='hidden' name='action' value='allow_current'>
+                    <button type='submit'>一键放行当前访问端</button>
+                </form>
+            </div>
+            <form method='post' class='toolbar'>
+                <input type='hidden' name='action' value='add_ip'>
+                <input type='text' name='ip' placeholder='输入 IPv4 或 IPv6 地址'>
+                <button type='submit'>新增白名单</button>
+            </form>
+        </div>
+
+        <div class='card'>
+            <h2>现有白名单</h2>
+            <table>
+                <thead>
+                    <tr><th>IP</th><th>来源</th><th>加入时间</th><th>操作</th></tr>
+                </thead>
+                <tbody>
+                    {''.join(whitelist_rows)}
+                </tbody>
+            </table>
+        </div>
+
+        <div class='card'>
+            <h2>最近被拒绝的来源</h2>
+            <table>
+                <thead>
+                    <tr><th>IP</th><th>GEO</th><th>目标</th><th>最近请求时间</th><th>次数</th><th>操作</th></tr>
+                </thead>
+                <tbody>
+                    {''.join(rejected_rows)}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</body>
+</html>
+"""
+                body_bytes = body.encode("utf-8")
+                self.send_response(int(HTTPStatus.OK))
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body_bytes)))
+                self.end_headers()
+                self.wfile.write(body_bytes)
+
+            def _resolve_request_ip(self) -> str:
+                forwarded = self.headers.get("X-Forwarded-For", "")
+                if forwarded:
+                    first = forwarded.split(",", 1)[0].strip()
+                    if first:
+                        return first
+                return str(self.client_address[0])
+
+            def _redirect_whitelist(self, message: str, ok: bool) -> None:
+                query = urlencode({"message": message, "level": "ok" if ok else "error"})
+                self.send_response(int(HTTPStatus.SEE_OTHER))
+                self.send_header("Location", f"/whitelist?{query}")
+                self.end_headers()
 
             def log_message(self, format: str, *args) -> None:
                 return

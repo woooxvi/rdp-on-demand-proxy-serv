@@ -36,6 +36,7 @@ class WhitelistConfig:
     enabled: bool = True
     path: str = "/list.json"
     storage: str = "filesystem"
+    secret: str = ""
     k8_secret_name: str = "rdp-proxy-list"
     k8_secret_namespace: str = ""
     k8_secret_key: str = "list.json"
@@ -234,6 +235,7 @@ def load_config(config_path: str) -> AppConfig:
             enabled=bool(whitelist_raw.get("enabled", True)),
             path=str(whitelist_raw.get("path", "/list.json")).strip() or "/list.json",
             storage=str(whitelist_raw.get("storage", "filesystem")).strip().lower() or "filesystem",
+            secret=str(whitelist_raw.get("secret", notifications["telegram"].get("bot_token", ""))).strip(),
             k8_secret_name=str(whitelist_raw.get("k8_secret_name", "rdp-proxy-list")).strip() or "rdp-proxy-list",
             k8_secret_namespace=str(whitelist_raw.get("k8_secret_namespace", "")).strip(),
             k8_secret_key=str(whitelist_raw.get("k8_secret_key", "list.json")).strip() or "list.json",

@@ -23,6 +23,8 @@ whitelist:
   enabled: true
   storage: filesystem # filesystem or k8
   path: /list.json
+  # 留空时默认复用 Telegram bot_token 作为加密密钥；若要跨渠道或独立轮换，建议单独配置
+  secret: ""
   k8_secret_name: rdp-proxy-list
   k8_secret_namespace: ""
   k8_secret_key: list.json
