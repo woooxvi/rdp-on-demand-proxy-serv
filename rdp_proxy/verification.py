@@ -108,6 +108,10 @@ class VerificationService:
         url = f"{self._external_base_url}/verify?token={token}"
         return token, evt, url
 
+    @property
+    def whitelist_url(self) -> str:
+        return f"{self._external_base_url}/whitelist"
+
     def create_action_links(self, target: str) -> tuple[str, str]:
         now = time.time()
         keep_token = uuid4().hex
@@ -143,6 +147,31 @@ class VerificationService:
         with self._lock:
             vt = self._tokens.get(token)
             return bool(vt and vt.approved)
+
+    def list_pending_verification_links(self, limit: int = 5) -> list[dict[str, str]]:
+        now = time.time()
+        with self._lock:
+            self._cleanup_locked(now)
+            pending = [
+                vt
+                for vt in self._tokens.values()
+                if (not vt.used) and vt.expires_at >= now
+            ]
+        pending.sort(key=lambda item: item.created_at, reverse=True)
+        limited = pending[: max(1, int(limit))]
+        results: list[dict[str, str]] = []
+        for vt in limited:
+            target = str(vt.meta.get("target", "")) if isinstance(vt.meta, dict) else ""
+            client_ip = str(vt.meta.get("client_ip", "")) if isinstance(vt.meta, dict) else ""
+            results.append(
+                {
+                    "token": vt.token,
+                    "target": target,
+                    "client_ip": client_ip,
+                    "verify_url": f"{self._external_base_url}/verify?token={vt.token}",
+                }
+            )
+        return results
 
     def cancel_token(self, token: str) -> bool:
         if not token:

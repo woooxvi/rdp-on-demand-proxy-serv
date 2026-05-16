@@ -1357,6 +1357,7 @@ class RDPProxyApp:
             cfg.notifications,
             verification_message_ttl_seconds=cfg.security.token_ttl_seconds,
             inbound_text_handler=self._handle_whitelist_message,
+            inbound_command_handler=self._handle_telegram_command,
         )
         self._targets: list[TargetProxy] = [
             TargetProxy(
@@ -1443,6 +1444,61 @@ class RDPProxyApp:
     def _record_whitelist_rejection(self, client_ip: str, target_name: str) -> None:
         geo_text = self._notifier.resolve_geo_text(client_ip)
         self._whitelist.record_rejected_ip(client_ip, geo_text=geo_text, target_name=target_name)
+
+    def _handle_telegram_command(self, text: str) -> tuple[bool, str]:
+        command_line = text.strip()
+        parts = command_line.split()
+        if not parts:
+            return False, "empty command"
+
+        command = parts[0].lower()
+        if command in {"/help", "/start"}:
+            return True, (
+                "可用命令:\n"
+                "/control - 获取白名单管理页链接\n"
+                "/quick-approve [n] - 获取最近待授权链接(默认1条)\n"
+                "/action <target> <keep|shutdown> - 生成一次性动作链接"
+            )
+
+        if command == "/control":
+            return True, f"控制页面: {self._verification.whitelist_url}"
+
+        if command == "/quick-approve":
+            limit = 1
+            if len(parts) >= 2:
+                with suppress(ValueError):
+                    limit = max(1, min(5, int(parts[1])))
+            pending_links = self._verification.list_pending_verification_links(limit=limit)
+            if not pending_links:
+                return False, "当前没有待授权请求"
+            lines = ["最近待授权链接:"]
+            for item in pending_links:
+                target = str(item.get("target", ""))
+                client_ip = str(item.get("client_ip", ""))
+                verify_url = str(item.get("verify_url", ""))
+                lines.append(f"- {target} {client_ip}: {verify_url}")
+            return True, "\n".join(lines)
+
+        if command == "/action":
+            if len(parts) < 3:
+                return False, "用法: /action <target> <keep|shutdown>"
+            target_name = parts[1]
+            mode = parts[2].lower()
+            target = self._target_by_name.get(target_name)
+            if target is None:
+                available = ", ".join(sorted(self._target_by_name.keys()))
+                return False, f"未知 target: {target_name}. 可选: {available}"
+            keep_url, shutdown_url = self._verification.create_action_links(target_name)
+            if mode in {"keep", "keep_running"}:
+                return True, f"保持开机链接: {keep_url}"
+            if mode in {"shutdown", "shutdown_on_idle", "stop"}:
+                return True, f"关机策略链接: {shutdown_url}"
+            return False, "动作参数仅支持 keep 或 shutdown"
+
+        if command == "/whitelist":
+            return True, f"白名单管理页: {self._verification.whitelist_url}"
+
+        return False, "未知命令，发送 /help 查看支持列表"
 
     def start(self) -> None:
         self._verification.start()

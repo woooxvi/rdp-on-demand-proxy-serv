@@ -35,6 +35,7 @@ class Notifier:
         config: NotificationsConfig,
         verification_message_ttl_seconds: int = 300,
         inbound_text_handler: Callable[[str], tuple[bool, str]] | None = None,
+        inbound_command_handler: Callable[[str], tuple[bool, str]] | None = None,
     ):
         self._cfg = config
         self._verification_message_ttl_seconds = max(1, int(verification_message_ttl_seconds))
@@ -42,6 +43,7 @@ class Notifier:
         self._telegram_verification_messages: dict[str, list[int]] = {}
         self._telegram_disconnect_messages: dict[str, list[int]] = {}
         self._telegram_inbound_handler = inbound_text_handler
+        self._telegram_command_handler = inbound_command_handler
         self._telegram_poll_thread: threading.Thread | None = None
         self._telegram_poll_stop = threading.Event()
         self._telegram_update_offset: int | None = None
@@ -498,9 +500,6 @@ class Notifier:
             self._handle_telegram_message(message)
 
     def _handle_telegram_message(self, message: dict) -> None:
-        if self._telegram_inbound_handler is None:
-            return
-
         chat = message.get("chat")
         if not isinstance(chat, dict):
             return
@@ -512,16 +511,27 @@ class Notifier:
         if not text:
             return
 
-        ok, detail = self._telegram_inbound_handler(text)
+        ok = False
+        detail = "unsupported message"
+        prefix = "处理失败"
+        if text.startswith("/") and self._telegram_command_handler is not None:
+            ok, detail = self._telegram_command_handler(text)
+            prefix = "命令执行成功" if ok else "命令执行失败"
+        elif self._telegram_inbound_handler is not None:
+            ok, detail = self._telegram_inbound_handler(text)
+            prefix = "白名单处理成功" if ok else "白名单处理失败"
+        else:
+            detail = "inbound handler is disabled"
+
         log_with_data(
             self._logger,
             logging.INFO,
             "Telegram inbound message processed",
             accepted=ok,
             detail=detail,
-            text=text,
+            inbound_text=text,
         )
-        reply_text = f"白名单处理成功: {detail}" if ok else f"白名单处理失败: {detail}"
+        reply_text = f"{prefix}: {detail}"
         self._send_telegram_reply(chat_id, reply_text, reply_to_message_id=message.get("message_id"))
 
     def _send_telegram_reply(self, chat_id: str, text: str, reply_to_message_id: object = None) -> bool:
