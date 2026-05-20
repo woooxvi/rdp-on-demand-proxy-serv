@@ -36,6 +36,14 @@ class ActionToken:
     action: str
 
 
+@dataclass
+class ControlAuthToken:
+    token: str
+    created_at: float
+    expires_at: float
+    used: bool
+
+
 class VerificationService:
     def __init__(
         self,
@@ -57,6 +65,7 @@ class VerificationService:
         self._ttl_seconds = ttl_seconds
         self._tokens: dict[str, VerificationToken] = {}
         self._action_tokens: dict[str, ActionToken] = {}
+        self._control_auth_tokens: dict[str, ControlAuthToken] = {}
         self._lock = threading.Lock()
         self._logger = logging.getLogger("rdp_proxy.verification")
         self._on_verified = on_verified
@@ -107,6 +116,38 @@ class VerificationService:
 
         url = f"{self._external_base_url}/verify?token={token}"
         return token, evt, url
+
+    def create_control_auth_token(self) -> tuple[str, str]:
+        """Generate a one-time control panel auth token (valid for 1 hour max)."""
+        now = time.time()
+        token = uuid4().hex
+        auth_ttl = min(3600, self._ttl_seconds)  # Max 1 hour
+
+        cat = ControlAuthToken(
+            token=token,
+            created_at=now,
+            expires_at=now + auth_ttl,
+            used=False,
+        )
+        with self._lock:
+            self._cleanup_locked(now)
+            self._control_auth_tokens[token] = cat
+
+        auth_url = f"{self._external_base_url}/whitelist?auth={token}"
+        return token, auth_url
+
+    def is_control_auth_valid(self, token: str) -> bool:
+        """Check if control auth token is valid (not used, not expired)."""
+        if not token:
+            return False
+        with self._lock:
+            now = time.time()
+            self._cleanup_locked(now)
+            cat = self._control_auth_tokens.get(token)
+            if not cat or cat.used or cat.expires_at < now:
+                return False
+            cat.used = True
+            return True
 
     @property
     def whitelist_url(self) -> str:
@@ -205,6 +246,10 @@ class VerificationService:
         ]
         for k in action_expired:
             self._action_tokens.pop(k, None)
+
+        auth_expired = [k for k, v in self._control_auth_tokens.items() if v.expires_at < now or (v.used and now - v.created_at > 3600)]
+        for k in auth_expired:
+            self._control_auth_tokens.pop(k, None)
 
     def _make_handler(self) -> type[BaseHTTPRequestHandler]:
         service = self
@@ -387,8 +432,32 @@ class VerificationService:
                 self._redirect_whitelist(detail, ok)
 
             def _render_whitelist_page(self, parsed) -> None:
-                visitor_ip = self._resolve_request_ip()
                 query = parse_qs(parsed.query)
+                auth_token = query.get("auth", [""])[0]
+                is_authenticated = service.is_control_auth_valid(auth_token) if auth_token else False
+
+                if not is_authenticated and not auth_token:
+                    self._send_html(
+                        HTTPStatus.UNAUTHORIZED,
+                        "<html><head><meta charset='utf-8'></head><body style='font-family:sans-serif;padding:20px'>"
+                        "<h1>RDP 代理 - 管理页面</h1>"
+                        "<p>访问管理页面需要通过 IM 指令 <code>/control</code> 获取授权链接。</p>"
+                        "<p>请在 Telegram 中输入 <code>/control</code> 获取包含访问令牌的链接。</p>"
+                        "</body></html>"
+                    )
+                    return
+
+                if not is_authenticated:
+                    self._send_html(
+                        HTTPStatus.UNAUTHORIZED,
+                        "<html><head><meta charset='utf-8'></head><body style='font-family:sans-serif;padding:20px'>"
+                        "<h1>链接已失效</h1>"
+                        "<p>管理链接已过期或已被使用。请在 IM 中重新输入 <code>/control</code> 获取新链接。</p>"
+                        "</body></html>"
+                    )
+                    return
+
+                visitor_ip = self._resolve_request_ip()
                 flash_message = query.get("message", [""])[0]
                 flash_level = query.get("level", [""])[0]
                 whitelist_entries = service._list_whitelist_entries() if service._list_whitelist_entries else []

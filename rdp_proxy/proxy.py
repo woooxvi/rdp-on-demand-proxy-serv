@@ -87,6 +87,8 @@ class TargetProxy:
         self._per_ip_connection_rate_limit = max(0, int(per_ip_connection_rate_limit))
         self._recent_approved_ips: dict[str, float] = {}
         self._ip_rate_windows: dict[str, tuple[float, int]] = {}
+        self._recent_ip_disconnects: dict[str, float] = {}  # Track last disconnect time for 10-min bypass
+        self._ip_reconnect_notify_window_seconds = 600  # 10 minutes
 
     def set_verification_notify_delay(self, delay_seconds: float) -> None:
         self._verification_notify_delay_seconds = max(0.0, float(delay_seconds))
@@ -215,6 +217,19 @@ class TargetProxy:
             self._recent_approved_ips.pop(client_ip, None)
         return False
 
+    def _should_send_reconnect_only_notification(self, client_ip: str) -> bool:
+        """Check if this is a recent reconnect within 10 minutes and only send notification."""
+        now = time.time()
+        with self._state_lock:
+            disconnect_at = self._recent_ip_disconnects.get(client_ip)
+            if disconnect_at is None:
+                return False
+            # If disconnected within 10 minutes, send only notification
+            if now - disconnect_at <= self._ip_reconnect_notify_window_seconds:
+                return True
+            self._recent_ip_disconnects.pop(client_ip, None)
+        return False
+
     def _mark_ip_approved(self, client_ip: str) -> None:
         if self._approved_ip_reuse_seconds <= 0:
             return
@@ -226,6 +241,17 @@ class TargetProxy:
             stale_ips = [ip for ip, ts in self._recent_approved_ips.items() if ts < expiry_before]
             for ip in stale_ips:
                 self._recent_approved_ips.pop(ip, None)
+
+    def _record_ip_disconnect(self, client_ip: str) -> None:
+        """Record the time when an IP disconnects for 10-minute reconnect bypass."""
+        now = time.time()
+        with self._state_lock:
+            self._recent_ip_disconnects[client_ip] = now
+            # Clean stale disconnect records
+            expiry_before = now - self._ip_reconnect_notify_window_seconds
+            stale_ips = [ip for ip, ts in self._recent_ip_disconnects.items() if ts < expiry_before]
+            for ip in stale_ips:
+                self._recent_ip_disconnects.pop(ip, None)
 
     def _consume_ip_connection_slot(self, client_ip: str) -> tuple[bool, float]:
         if self._per_ip_connection_rate_window_seconds <= 0 or self._per_ip_connection_rate_limit <= 0:
@@ -445,103 +471,127 @@ class TargetProxy:
                             replaced_client_port=int(replaced.get("client_port", 0)),
                         )
                     pending_registered = True
-                    token, evt, url = self._verification.create_token(
-                        {
-                            "target": self._target.name,
-                            "client_ip": client_ip,
-                            "instance_id": self._target.cloud.instance_id if self._target.cloud else "N/A",
-                        }
-                    )
-                    self._notifier.send_verification(client_ip, self._target, url, token=token)
-                    log_with_data(
-                        self._logger,
-                        logging.INFO,
-                        "Verification sent",
-                        connection_id=connection_id,
-                        client_ip=client_ip,
-                        token=token,
-                        verify_url=url,
-                    )
-                    self._append_connection_audit(
-                        "verification_sent",
-                        connection_id=connection_id,
-                        client_port=client_port,
-                        target=self._target.name,
-                        token=token,
-                        delay_seconds=round(self._verification_notify_delay_seconds, 2),
-                    )
-
-                    stage = "wait_verification"
-                    wait_start_ts = time.time()
-                    self._append_connection_audit(
-                        "verification_wait_started",
-                        connection_id=connection_id,
-                        client_port=client_port,
-                        target=self._target.name,
-                        wait_seconds=self._verification_wait_seconds,
-                    )
-                    approved, wait_reason = self._wait_for_verification_or_disconnect(
-                        client=client,
-                        event=evt,
-                        timeout_seconds=self._verification_wait_seconds,
-                    )
-                    self._append_connection_audit(
-                        "verification_wait_finished",
-                        connection_id=connection_id,
-                        client_port=client_port,
-                        target=self._target.name,
-                        approved=approved,
-                        reason=wait_reason,
-                        waited_seconds=round(time.time() - wait_start_ts, 2),
-                    )
-                    if not approved and wait_reason == "client_disconnected":
-                        self._verification.cancel_token(token)
-                        self._append_connection_audit(
-                            "verification_cancelled",
-                            connection_id=connection_id,
-                            client_port=client_port,
-                            target=self._target.name,
-                            reason=wait_reason,
+                    
+                    # Check if this is a recent reconnect (within 10 minutes) - if so, only send notification
+                    if self._should_send_reconnect_only_notification(client_ip):
+                        self._notifier.send_test_message(
+                            f"IP {client_ip} 已重新连接到 {self._target.name}\n无需再次授权，连接已通过"
                         )
-                        self._append_connection_audit(
-                            "connection_aborted",
-                            connection_id=connection_id,
-                            client_port=client_port,
-                            target=self._target.name,
-                            stage=stage,
-                            reason=wait_reason,
-                        )
-                        return
-                    if not approved:
                         log_with_data(
                             self._logger,
-                            logging.WARNING,
-                            "Verification timeout",
+                            logging.INFO,
+                            "Reconnect notification sent (10-min bypass)",
                             connection_id=connection_id,
                             client_ip=client_ip,
                             target=self._target.name,
                         )
                         self._append_connection_audit(
-                            "verification_timeout",
+                            "reconnect_notification_sent_bypass",
+                            connection_id=connection_id,
+                            client_port=client_port,
+                            target=self._target.name,
+                        )
+                        self._unregister_pending_verification(connection_id)
+                        pending_registered = False
+                        approved = True
+                    else:
+                        token, evt, url = self._verification.create_token(
+                            {
+                                "target": self._target.name,
+                                "client_ip": client_ip,
+                                "instance_id": self._target.cloud.instance_id if self._target.cloud else "N/A",
+                            }
+                        )
+                        self._notifier.send_verification(client_ip, self._target, url, token=token)
+                        log_with_data(
+                            self._logger,
+                            logging.INFO,
+                            "Verification sent",
+                            connection_id=connection_id,
+                            client_ip=client_ip,
+                            token=token,
+                            verify_url=url,
+                        )
+                        self._append_connection_audit(
+                            "verification_sent",
+                            connection_id=connection_id,
+                            client_port=client_port,
+                            target=self._target.name,
+                            token=token,
+                            delay_seconds=round(self._verification_notify_delay_seconds, 2),
+                        )
+
+                        stage = "wait_verification"
+                        wait_start_ts = time.time()
+                        self._append_connection_audit(
+                            "verification_wait_started",
                             connection_id=connection_id,
                             client_port=client_port,
                             target=self._target.name,
                             wait_seconds=self._verification_wait_seconds,
-                            reason=wait_reason,
                         )
-                        if self._deny_if_timeout:
+                        approved, wait_reason = self._wait_for_verification_or_disconnect(
+                            client=client,
+                            event=evt,
+                            timeout_seconds=self._verification_wait_seconds,
+                        )
+                        self._append_connection_audit(
+                            "verification_wait_finished",
+                            connection_id=connection_id,
+                            client_port=client_port,
+                            target=self._target.name,
+                            approved=approved,
+                            reason=wait_reason,
+                            waited_seconds=round(time.time() - wait_start_ts, 2),
+                        )
+                        if not approved and wait_reason == "client_disconnected":
+                            self._verification.cancel_token(token)
+                            self._append_connection_audit(
+                                "verification_cancelled",
+                                connection_id=connection_id,
+                                client_port=client_port,
+                                target=self._target.name,
+                                reason=wait_reason,
+                            )
                             self._append_connection_audit(
                                 "connection_aborted",
                                 connection_id=connection_id,
                                 client_port=client_port,
                                 target=self._target.name,
                                 stage=stage,
-                                reason="verification_timeout_deny",
+                                reason=wait_reason,
                             )
                             return
+                        if not approved:
+                            log_with_data(
+                                self._logger,
+                                logging.WARNING,
+                                "Verification timeout",
+                                connection_id=connection_id,
+                                client_ip=client_ip,
+                                target=self._target.name,
+                            )
+                            self._append_connection_audit(
+                                "verification_timeout",
+                                connection_id=connection_id,
+                                client_port=client_port,
+                                target=self._target.name,
+                                wait_seconds=self._verification_wait_seconds,
+                                reason=wait_reason,
+                            )
+                            if self._deny_if_timeout:
+                                self._append_connection_audit(
+                                    "connection_aborted",
+                                    connection_id=connection_id,
+                                    client_port=client_port,
+                                    target=self._target.name,
+                                    stage=stage,
+                                    reason="verification_timeout_deny",
+                                )
+                                return
 
-                    self._unregister_pending_verification(connection_id)
-                    pending_registered = False
+                        self._unregister_pending_verification(connection_id)
+                        pending_registered = False
 
                 if approved:
                     self._mark_ip_approved(client_ip)
@@ -698,6 +748,10 @@ class TargetProxy:
                 self._disconnect_notify_generation += 1
                 disconnect_generation = self._disconnect_notify_generation
                 previous_action = self._idle_action
+
+            # Record disconnect time for 10-minute reconnect bypass
+            if approved:
+                self._record_ip_disconnect(client_ip)
 
             if forwarding_slot_acquired:
                 self._single_session_lock.release()
@@ -1466,7 +1520,8 @@ class RDPProxyApp:
             )
 
         if command == "/control":
-            return True, f"控制页面: {self._verification.whitelist_url}"
+            token, auth_url = self._verification.create_control_auth_token()
+            return True, f"管理页面（此链接有效期1小时）: {auth_url}"
 
         if command in {"/quick-approve", "/quick_approve", "/approve"}:
             limit = 1
@@ -1507,10 +1562,12 @@ class RDPProxyApp:
             return False, "动作参数仅支持 keep 或 shutdown"
 
         if command == "/blacklist":
-            return True, f"请在控制页面操作黑名单: {self._verification.whitelist_url}"
+            token, auth_url = self._verification.create_control_auth_token()
+            return True, f"黑名单管理（此链接有效期1小时）: {auth_url}"
 
         if command == "/whitelist":
-            return True, f"白名单管理页: {self._verification.whitelist_url}"
+            token, auth_url = self._verification.create_control_auth_token()
+            return True, f"白名单管理页（此链接有效期1小时）: {auth_url}"
 
         return False, "未知命令，发送 /help 查看支持列表"
 
