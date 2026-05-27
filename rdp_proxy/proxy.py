@@ -89,6 +89,10 @@ class TargetProxy:
         self._ip_rate_windows: dict[str, tuple[float, int]] = {}
         self._recent_ip_disconnects: dict[str, float] = {}  # Track last disconnect time for 10-min bypass
         self._ip_reconnect_notify_window_seconds = 600  # 10 minutes
+        self._active_forwarding_connection_id = ""
+        self._active_forwarding_client_ip = ""
+        self._active_forwarding_client_socket: socket.socket | None = None
+        self._active_forwarding_upstream_socket: socket.socket | None = None
 
     def set_verification_notify_delay(self, delay_seconds: float) -> None:
         self._verification_notify_delay_seconds = max(0.0, float(delay_seconds))
@@ -253,6 +257,67 @@ class TargetProxy:
             for ip in stale_ips:
                 self._recent_ip_disconnects.pop(ip, None)
 
+    def _register_active_forwarding(
+        self,
+        connection_id: str,
+        client_ip: str,
+        client: socket.socket,
+        upstream: socket.socket,
+    ) -> None:
+        with self._state_lock:
+            self._active_forwarding_connection_id = connection_id
+            self._active_forwarding_client_ip = client_ip
+            self._active_forwarding_client_socket = client
+            self._active_forwarding_upstream_socket = upstream
+
+    def _clear_active_forwarding(self, connection_id: str) -> None:
+        with self._state_lock:
+            if self._active_forwarding_connection_id != connection_id:
+                return
+            self._active_forwarding_connection_id = ""
+            self._active_forwarding_client_ip = ""
+            self._active_forwarding_client_socket = None
+            self._active_forwarding_upstream_socket = None
+
+    def _try_takeover_same_ip_forwarding_slot(self, requester_connection_id: str, client_ip: str) -> bool:
+        stale_client: socket.socket | None = None
+        stale_upstream: socket.socket | None = None
+        stale_connection_id = ""
+
+        with self._state_lock:
+            if not self._active_forwarding_connection_id:
+                return False
+            if self._active_forwarding_client_ip != client_ip:
+                return False
+            if self._active_forwarding_connection_id == requester_connection_id:
+                return False
+
+            stale_connection_id = self._active_forwarding_connection_id
+            stale_client = self._active_forwarding_client_socket
+            stale_upstream = self._active_forwarding_upstream_socket
+
+        if stale_client is not None:
+            with suppress(OSError):
+                stale_client.shutdown(socket.SHUT_RDWR)
+            with suppress(OSError):
+                stale_client.close()
+
+        if stale_upstream is not None:
+            with suppress(OSError):
+                stale_upstream.shutdown(socket.SHUT_RDWR)
+            with suppress(OSError):
+                stale_upstream.close()
+
+        log_with_data(
+            self._logger,
+            logging.INFO,
+            "Forwarding slot takeover requested for reconnect",
+            target=self._target.name,
+            requester_connection_id=requester_connection_id,
+            replaced_connection_id=stale_connection_id,
+        )
+        return True
+
     def _consume_ip_connection_slot(self, client_ip: str) -> tuple[bool, float]:
         if self._per_ip_connection_rate_window_seconds <= 0 or self._per_ip_connection_rate_limit <= 0:
             return True, 0.0
@@ -318,6 +383,7 @@ class TargetProxy:
         forwarding_started = False
         pending_registered = False
         forwarding_slot_acquired = False
+        reconnect_bypass_applied = False
         c2u_bytes = 0
         u2c_bytes = 0
         with self._state_lock:
@@ -494,6 +560,7 @@ class TargetProxy:
                         self._unregister_pending_verification(connection_id)
                         pending_registered = False
                         approved = True
+                        reconnect_bypass_applied = True
                     else:
                         token, evt, url = self._verification.create_token(
                             {
@@ -599,6 +666,9 @@ class TargetProxy:
             stage = "wait_forwarding_slot"
             lock_ok, lock_reason = self._acquire_forwarding_slot_or_disconnect(
                 client=client,
+                connection_id=connection_id,
+                client_ip=client_ip,
+                allow_same_ip_takeover=reconnect_bypass_applied,
                 timeout_seconds=self._forwarding_slot_wait_seconds,
             )
             if not lock_ok:
@@ -669,6 +739,7 @@ class TargetProxy:
             )
 
             forwarding_started = True
+            self._register_active_forwarding(connection_id, client_ip, client, upstream)
             stage = "forwarding"
             c2u_bytes, u2c_bytes = self._pipe_bidirectional(client, upstream)
             log_with_data(
@@ -749,9 +820,12 @@ class TargetProxy:
                 disconnect_generation = self._disconnect_notify_generation
                 previous_action = self._idle_action
 
-            # Record disconnect time for 10-minute reconnect bypass
-            if approved:
+            # Only real forwarding disconnects should enable reconnect bypass.
+            if approved and forwarding_started:
                 self._record_ip_disconnect(client_ip)
+
+            if forwarding_slot_acquired:
+                self._clear_active_forwarding(connection_id)
 
             if forwarding_slot_acquired:
                 self._single_session_lock.release()
@@ -860,14 +934,24 @@ class TargetProxy:
     def _acquire_forwarding_slot_or_disconnect(
         self,
         client: socket.socket,
+        connection_id: str,
+        client_ip: str,
+        allow_same_ip_takeover: bool,
         timeout_seconds: int,
     ) -> tuple[bool, str]:
         deadline = time.time() + max(0, timeout_seconds)
         waiting_logged = False
+        takeover_attempted = False
 
         while time.time() < deadline:
             if self._single_session_lock.acquire(blocking=False):
                 return True, "acquired"
+
+            if allow_same_ip_takeover and not takeover_attempted:
+                takeover_attempted = True
+                if self._try_takeover_same_ip_forwarding_slot(connection_id, client_ip):
+                    # Give the previous forwarding thread a short chance to observe socket close and release lock.
+                    continue
 
             if not waiting_logged:
                 log_with_data(
