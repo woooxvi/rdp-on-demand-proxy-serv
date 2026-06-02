@@ -1,6 +1,6 @@
 # RDP On-Demand Proxy
 
-当前版本: v0.2.8
+当前版本: v0.2.9
 
 轻量级 Python TCP 代理，面向 Windows RDP 按需启停场景。内置腾讯云 CVM、阿里云 ECS、Telegram/钉钉/企业微信通知，支持 Docker 部署。
 
@@ -90,6 +90,7 @@ curl -X POST http://YOUR_PROXY_PUBLIC_IP:8080/whitelist \
 如果启用了 Telegram，并且消息来自配置中的 `chat_id`，直接在机器人对话中发送纯 IP 文本也会自动加入白名单，机器人会原消息回复处理结果，控制台也会打印处理日志。
 
 K8 模式下，程序会通过 Kubernetes API 更新挂载的 Secret，前提是 Pod 对应 ServiceAccount 具备写权限。
+运行期间会按短周期自动从 Secret 刷新白名单缓存，以便多副本场景下尽快同步新增/删除操作。
 
 浏览器访问 `http://YOUR_PROXY_PUBLIC_IP:8080/whitelist` 可进入白名单管理页，支持：
 

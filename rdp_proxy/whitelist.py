@@ -37,6 +37,8 @@ class WhitelistStore:
         self._entries_by_cipher: dict[str, dict[str, object]] = {}
         self._rejected_by_ip: dict[str, dict[str, object]] = {}
         self._last_loaded_mtime_ns: int | None = None
+        self._last_k8_refresh_at = 0.0
+        self._k8_refresh_interval_seconds = 3.0
         self._load_from_storage()
 
     def _normalize_mode(self, value: str) -> str:
@@ -258,25 +260,44 @@ class WhitelistStore:
         return self._path.read_text(encoding="utf-8")
 
     def _refresh_if_needed_locked(self) -> None:
-        if self._mode != "filesystem":
+        if self._mode == "filesystem":
+            try:
+                mtime_ns = self._path.stat().st_mtime_ns
+            except OSError:
+                return
+            if self._last_loaded_mtime_ns == mtime_ns:
+                return
+            try:
+                text = self._path.read_text(encoding="utf-8")
+                payload = json.loads(text) if text.strip() else {}
+                self._entries_by_cipher, self._rejected_by_ip = self._decode_payload(payload)
+                self._last_loaded_mtime_ns = mtime_ns
+            except Exception as exc:
+                log_with_data(
+                    self._logger,
+                    logging.WARNING,
+                    "Whitelist file refresh failed",
+                    path=str(self._path),
+                    error=str(exc),
+                )
             return
+
+        now = time.monotonic()
+        if now - self._last_k8_refresh_at < self._k8_refresh_interval_seconds:
+            return
+
         try:
-            mtime_ns = self._path.stat().st_mtime_ns
-        except OSError:
-            return
-        if self._last_loaded_mtime_ns == mtime_ns:
-            return
-        try:
-            text = self._path.read_text(encoding="utf-8")
+            text = self._read_k8_secret()
             payload = json.loads(text) if text.strip() else {}
             self._entries_by_cipher, self._rejected_by_ip = self._decode_payload(payload)
-            self._last_loaded_mtime_ns = mtime_ns
+            self._last_k8_refresh_at = now
         except Exception as exc:
             log_with_data(
                 self._logger,
                 logging.WARNING,
-                "Whitelist file refresh failed",
-                path=str(self._path),
+                "Whitelist secret refresh failed",
+                secret_name=self._secret_name,
+                secret_namespace=self._resolve_k8_namespace(),
                 error=str(exc),
             )
 
